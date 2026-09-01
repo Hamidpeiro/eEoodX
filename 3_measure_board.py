@@ -1,14 +1,26 @@
 """
 Step 3: Measure a single board from one photo.
 
-Pipeline: undistort -> threshold against background -> find board contour
--> minAreaRect -> sub-pixel corner refinement -> map corners to real-world
-mm via the homography from step 2 -> compute length/width -> sample color
--> write a JSON result.
+Pipeline:
+    undistort
+    -> detect 4 ArUco markers
+    -> calculate live homography
+    -> define workspace from ArUco markers
+    -> threshold timber inside workspace
+    -> remove ArUco markers
+    -> find timber contour
+    -> minAreaRect
+    -> sub-pixel corner refinement
+    -> map timber corners to real-world mm
+    -> compute length/width
+    -> sample color
+    -> write JSON result.
 
 Usage:
     python 3_measure_board.py path/to/board_photo.jpg
-    python 3_measure_board.py path/to/board_photo.jpg --debug   # saves mask/overlay for tuning
+
+Debug:
+    python 3_measure_board.py path/to/board_photo.jpg --debug
 """
 
 import cv2
@@ -20,59 +32,217 @@ import argparse
 import config
 
 
+# ============================================================
+# CAMERA UNDISTORTION
+# ============================================================
+
 def undistort(img):
+    """Remove lens distortion using the saved camera calibration."""
+
     calib = np.load(config.CAMERA_CALIB_FILE)
-    return cv2.undistort(img, calib["camera_matrix"], calib["dist_coeffs"])
+
+    return cv2.undistort(
+        img,
+        calib["camera_matrix"],
+        calib["dist_coeffs"]
+    )
 
 
-def segment_board(img):
-    """Threshold out the board from a known-uniform background. Returns the
-    largest contour above the area cutoff, or None."""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    bg_mask = cv2.inRange(hsv, config.BACKGROUND_HSV_LOWER, config.BACKGROUND_HSV_UPPER)
+# ============================================================
+# TIMBER SEGMENTATION
+# ============================================================
+
+def segment_board(img, workspace_px):
+    """Detect timber only inside the workspace defined by
+    the four ArUco marker centers.
+
+    workspace_px order:
+
+        0 ---------------- 1
+        |                  |
+        |      TIMBER      |
+        |                  |
+        3 ---------------- 2
+
+    Returns:
+        contour, board_mask
+    """
+
+    # --------------------------------------------------------
+    # 1. Create workspace mask
+    # --------------------------------------------------------
+
+    workspace_mask = np.zeros(
+        img.shape[:2],
+        dtype=np.uint8
+    )
+
+    workspace_pts = np.array(
+        workspace_px,
+        dtype=np.int32
+    )
+
+    cv2.fillPoly(
+        workspace_mask,
+        [workspace_pts],
+        255
+    )
+
+    # --------------------------------------------------------
+    # 2. Convert image to HSV
+    # --------------------------------------------------------
+
+    hsv = cv2.cvtColor(
+        img,
+        cv2.COLOR_BGR2HSV
+    )
+
+    # --------------------------------------------------------
+    # 3. Detect background
+    # --------------------------------------------------------
+
+    bg_mask = cv2.inRange(
+        hsv,
+        config.BACKGROUND_HSV_LOWER,
+        config.BACKGROUND_HSV_UPPER
+    )
+
+    # Everything that is NOT background becomes
+    # a possible timber region.
     board_mask = cv2.bitwise_not(bg_mask)
 
-    # Clean up small noise / fill small holes
-    kernel = np.ones((15, 15), np.uint8)
-    board_mask = cv2.morphologyEx(board_mask, cv2.MORPH_OPEN, kernel)
-    board_mask = cv2.morphologyEx(board_mask, cv2.MORPH_CLOSE, kernel)
+    # --------------------------------------------------------
+    # 4. Keep ONLY the ArUco workspace
+    # --------------------------------------------------------
 
-    contours, _ = cv2.findContours(board_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    board_mask = cv2.bitwise_and(
+        board_mask,
+        workspace_mask
+    )
+
+    # --------------------------------------------------------
+    # 5. Remove ArUco markers
+    # --------------------------------------------------------
+    #
+    # We remove a circular region around each marker center.
+    #
+    # The marker itself must not become the timber contour.
+    #
+    # 70 px is an initial value and can be adjusted later
+    # depending on the camera resolution and marker size.
+    # --------------------------------------------------------
+
+    marker_radius = 70
+
+    for point in workspace_px:
+
+        x = int(round(point[0]))
+        y = int(round(point[1]))
+
+        cv2.circle(
+            board_mask,
+            (x, y),
+            marker_radius,
+            0,
+            -1
+        )
+
+    # --------------------------------------------------------
+    # 6. Morphological cleanup
+    # --------------------------------------------------------
+
+    kernel = np.ones(
+        (15, 15),
+        dtype=np.uint8
+    )
+
+    board_mask = cv2.morphologyEx(
+        board_mask,
+        cv2.MORPH_OPEN,
+        kernel
+    )
+
+    board_mask = cv2.morphologyEx(
+        board_mask,
+        cv2.MORPH_CLOSE,
+        kernel
+    )
+
+    # --------------------------------------------------------
+    # 7. Find contours
+    # --------------------------------------------------------
+
+    contours, _ = cv2.findContours(
+        board_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
     if not contours:
         return None, board_mask
 
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < config.MIN_BOARD_CONTOUR_AREA_PX:
+    # --------------------------------------------------------
+    # 8. Remove very small contours
+    # --------------------------------------------------------
+
+    valid_contours = []
+
+    for contour in contours:
+
+        area = cv2.contourArea(contour)
+
+        if area >= config.MIN_BOARD_CONTOUR_AREA_PX:
+            valid_contours.append(contour)
+
+    if not valid_contours:
         return None, board_mask
+
+    # --------------------------------------------------------
+    # 9. Select largest valid contour
+    # --------------------------------------------------------
+
+    largest = max(
+        valid_contours,
+        key=cv2.contourArea
+    )
 
     return largest, board_mask
 
 
-# def refine_corners_subpixel(img_gray, corners):
-#     """cv2.cornerSubPix expects float32 points and a small search window."""
-#     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
-#     pts = corners.reshape(-1, 1, 2).astype(np.float32)
-#     refined = cv2.cornerSubPix(img_gray, pts, (5, 5), (-1, -1), criteria)
-#     return refined.reshape(-1, 2)
-def refine_corners_subpixel(img_gray, corners):
-    """Refine rectangle corners to sub-pixel accuracy.
+# ============================================================
+# SUB-PIXEL CORNER REFINEMENT
+# ============================================================
 
-    cornerSubPix requires all initial points to be inside the image,
-    so we clamp the points before refinement.
-    """
+def refine_corners_subpixel(img_gray, corners):
+    """Refine rectangle corners to sub-pixel accuracy."""
+
     criteria = (
-        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+        cv2.TERM_CRITERIA_EPS +
+        cv2.TERM_CRITERIA_MAX_ITER,
         30,
         0.01
     )
 
-    pts = corners.reshape(-1, 1, 2).astype(np.float32)
+    pts = corners.reshape(
+        -1,
+        1,
+        2
+    ).astype(np.float32)
 
     height, width = img_gray.shape[:2]
 
     # Keep points inside the image.
-    pts[:, 0, 0] = np.clip(pts[:, 0, 0], 0, width - 1)
-    pts[:, 0, 1] = np.clip(pts[:, 0, 1], 0, height - 1)
+    pts[:, 0, 0] = np.clip(
+        pts[:, 0, 0],
+        0,
+        width - 1
+    )
+
+    pts[:, 0, 1] = np.clip(
+        pts[:, 0, 1],
+        0,
+        height - 1
+    )
 
     refined = cv2.cornerSubPix(
         img_gray,
@@ -82,177 +252,782 @@ def refine_corners_subpixel(img_gray, corners):
         criteria
     )
 
-    return refined.reshape(-1, 2)
+    return refined.reshape(
+        -1,
+        2
+    )
+
+
+# ============================================================
+# PIXEL -> REAL WORLD MM
+# ============================================================
 
 def pixel_to_mm(H, pts_px):
-    pts_px = np.array(pts_px, dtype=np.float32).reshape(-1, 1, 2)
-    pts_mm = cv2.perspectiveTransform(pts_px, H).reshape(-1, 2)
-    return pts_mm
+    """Transform image pixel coordinates into world coordinates."""
 
+    pts_px = np.array(
+        pts_px,
+        dtype=np.float32
+    ).reshape(
+        -1,
+        1,
+        2
+    )
+
+    pts_mm = cv2.perspectiveTransform(
+        pts_px,
+        H
+    )
+
+    return pts_mm.reshape(
+        -1,
+        2
+    )
+
+
+# ============================================================
+# LIVE ARUCO HOMOGRAPHY
+# ============================================================
 
 def compute_live_homography(img_undist):
-    """Detect the 4 corner ArUco markers in THIS photo (same frame as the
-    board) and compute a fresh homography from them, rather than trusting a
-    cached one from setup day. This catches camera drift/bumps between
-    shots - if a marker has moved, the reprojection error below will jump.
+    """Detect the four ArUco markers and calculate the
+    pixel -> millimetre homography.
 
-    Returns (H, reprojection_errors_mm) or (None, None) if markers weren't
-    all found.
+    Marker arrangement:
+
+        0 ---------------- 1
+        |                  |
+        |                  |
+        |                  |
+        3 ---------------- 2
+
+    The world coordinates come from config.py.
+
+    Returns:
+
+        H
+        errors_mm
+        detected
+
+    or:
+
+        None, None, None
     """
-    aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, config.ARUCO_DICT))
-    aruco_params = cv2.aruco.DetectorParameters()
-    detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
-    gray = cv2.cvtColor(img_undist, cv2.COLOR_BGR2GRAY)
-    corners, ids, _ = detector.detectMarkers(gray)
+    # --------------------------------------------------------
+    # 1. Create ArUco detector
+    # --------------------------------------------------------
+
+    aruco_dict = cv2.aruco.getPredefinedDictionary(
+        getattr(
+            cv2.aruco,
+            config.ARUCO_DICT
+        )
+    )
+
+    aruco_params = cv2.aruco.DetectorParameters()
+
+    detector = cv2.aruco.ArucoDetector(
+        aruco_dict,
+        aruco_params
+    )
+
+    # --------------------------------------------------------
+    # 2. Convert to grayscale
+    # --------------------------------------------------------
+
+    gray = cv2.cvtColor(
+        img_undist,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    # --------------------------------------------------------
+    # 3. Detect markers
+    # --------------------------------------------------------
+
+    corners, ids, _ = detector.detectMarkers(
+        gray
+    )
 
     if ids is None:
-        return None, None
+
+        print(
+            "  warning: no ArUco markers detected"
+        )
+
+        return None, None, None
 
     ids = ids.flatten()
-    detected = {int(i): c[0].mean(axis=0) for i, c in zip(ids, corners)}
 
-    expected_ids = set(config.MARKER_WORLD_POSITIONS_MM.keys())
-    if not expected_ids.issubset(detected.keys()):
-        missing = expected_ids - set(detected.keys())
-        print(f"  warning: markers not all visible in this shot (missing {missing})")
-        return None, None
+    # --------------------------------------------------------
+    # 4. Calculate center of every detected marker
+    # --------------------------------------------------------
 
-    pixel_pts, world_pts = [], []
-    for marker_id, world_xy in config.MARKER_WORLD_POSITIONS_MM.items():
-        pixel_pts.append(detected[marker_id])
-        world_pts.append(world_xy)
-    pixel_pts = np.array(pixel_pts, dtype=np.float32)
-    world_pts = np.array(world_pts, dtype=np.float32)
+    detected = {}
 
-    H, _ = cv2.findHomography(pixel_pts, world_pts, method=0)
+    for marker_id, marker_corners in zip(
+        ids,
+        corners
+    ):
 
-    reprojected = cv2.perspectiveTransform(pixel_pts.reshape(-1, 1, 2), H).reshape(-1, 2)
-    errors_mm = np.linalg.norm(reprojected - world_pts, axis=1)
+        center = marker_corners[0].mean(
+            axis=0
+        )
 
-    return H, errors_mm
+        detected[int(marker_id)] = center
 
+    # --------------------------------------------------------
+    # 5. Check required marker IDs
+    # --------------------------------------------------------
+
+    expected_ids = set(
+        config.MARKER_WORLD_POSITIONS_MM.keys()
+    )
+
+    detected_ids = set(
+        detected.keys()
+    )
+
+    if not expected_ids.issubset(
+        detected_ids
+    ):
+
+        missing = (
+            expected_ids -
+            detected_ids
+        )
+
+        print(
+            f"  warning: markers not all visible "
+            f"(missing {missing})"
+        )
+
+        return None, None, None
+
+    # --------------------------------------------------------
+    # 6. Build pixel/world correspondences
+    # --------------------------------------------------------
+
+    pixel_pts = []
+    world_pts = []
+
+    for marker_id, world_xy in (
+        config.MARKER_WORLD_POSITIONS_MM.items()
+    ):
+
+        pixel_pts.append(
+            detected[marker_id]
+        )
+
+        world_pts.append(
+            world_xy
+        )
+
+    pixel_pts = np.array(
+        pixel_pts,
+        dtype=np.float32
+    )
+
+    world_pts = np.array(
+        world_pts,
+        dtype=np.float32
+    )
+
+    # --------------------------------------------------------
+    # 7. Calculate homography
+    # --------------------------------------------------------
+
+    H, _ = cv2.findHomography(
+        pixel_pts,
+        world_pts,
+        method=0
+    )
+
+    if H is None:
+
+        print(
+            "  warning: could not calculate homography"
+        )
+
+        return None, None, None
+
+    # --------------------------------------------------------
+    # 8. Check marker reprojection
+    # --------------------------------------------------------
+
+    reprojected = cv2.perspectiveTransform(
+        pixel_pts.reshape(
+            -1,
+            1,
+            2
+        ),
+        H
+    ).reshape(
+        -1,
+        2
+    )
+
+    errors_mm = np.linalg.norm(
+        reprojected - world_pts,
+        axis=1
+    )
+
+    # --------------------------------------------------------
+    # 9. Print marker coordinates
+    # --------------------------------------------------------
+
+    print(
+        "\nArUco marker positions in world coordinates:"
+    )
+
+    for marker_id, point in zip(
+        config.MARKER_WORLD_POSITIONS_MM.keys(),
+        reprojected
+    ):
+
+        print(
+            f"  Marker {marker_id}: "
+            f"X={point[0]:.2f} mm, "
+            f"Y={point[1]:.2f} mm"
+        )
+
+    print(
+        f"\n  Maximum marker reprojection error: "
+        f"{errors_mm.max():.4f} mm"
+    )
+
+    return (
+        H,
+        errors_mm,
+        detected
+    )
+
+
+# ============================================================
+# COLOR SAMPLING
+# ============================================================
 
 def sample_color_lab(img_bgr, contour):
-    """Average color from the interior of the board (eroded mask so we
-    avoid edge/background bleed), returned in LAB."""
-    mask = np.zeros(img_bgr.shape[:2], np.uint8)
-    cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
-    mask = cv2.erode(mask, np.ones((25, 25), np.uint8))  # pull in from edges
+    """Calculate average LAB color from inside the timber."""
 
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    mean_lab = cv2.mean(lab, mask=mask)[:3]  # (L, a, b) in OpenCV's 0-255 LAB scale
+    mask = np.zeros(
+        img_bgr.shape[:2],
+        np.uint8
+    )
+
+    cv2.drawContours(
+        mask,
+        [contour],
+        -1,
+        255,
+        thickness=cv2.FILLED
+    )
+
+    # Pull away from edges to avoid background contamination.
+    mask = cv2.erode(
+        mask,
+        np.ones(
+            (25, 25),
+            np.uint8
+        )
+    )
+
+    lab = cv2.cvtColor(
+        img_bgr,
+        cv2.COLOR_BGR2LAB
+    )
+
+    mean_lab = cv2.mean(
+        lab,
+        mask=mask
+    )[:3]
 
     if config.USE_COLOR_CHART_CORRECTION:
-        # Plug your color-chart correction in here once you have a reference
-        # patch ROI defined - e.g. a linear correction matrix fit against
-        # known chart values. Left as a stub since it depends on your chart
-        # placement.
+
+        # Placeholder for future color-chart correction.
         pass
 
-    return {"L": round(mean_lab[0], 2), "a": round(mean_lab[1], 2), "b": round(mean_lab[2], 2)}
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("image_path")
-    parser.add_argument("--debug", action="store_true", help="save mask/overlay images for tuning")
-    args = parser.parse_args()
-
-    img = cv2.imread(args.image_path)
-    if img is None:
-        print(f"Could not read image: {args.image_path}")
-        raise SystemExit(1)
-
-    if not os.path.exists(config.CAMERA_CALIB_FILE):
-        print(f"Missing {config.CAMERA_CALIB_FILE} - run 1_calibrate_camera.py first.")
-        raise SystemExit(1)
-
-    img_undist = undistort(img)
-
-    # Prefer a homography computed live from THIS photo's markers - catches
-    # any camera movement since the last shot. Falls back to the cached one
-    # from 2_setup_workspace.py (with a loud warning) only if markers aren't
-    # all visible right now, e.g. temporarily blocked by the board itself.
-    H, errors_mm = compute_live_homography(img_undist)
-    if H is not None:
-        max_err = errors_mm.max()
-        print(f"  live homography ok, max marker reprojection error: {max_err:.2f}mm")
-        if max_err > 2.0:
-            print(f"  warning: {max_err:.2f}mm marker error is high - check nothing "
-                  "bumped the rig, or re-run 2_setup_workspace.py")
-    else:
-        if not os.path.exists(config.HOMOGRAPHY_FILE):
-            print("Could not detect all corner markers in this photo, and no "
-                  f"cached homography at {config.HOMOGRAPHY_FILE}. "
-                  "Run 2_setup_workspace.py first, or make sure all 4 markers "
-                  "are visible and unobstructed.")
-            raise SystemExit(1)
-        print("  warning: could not see all markers in this shot - falling back "
-              "to the cached homography from 2_setup_workspace.py. Move the "
-              "board so it doesn't block the markers if this keeps happening.")
-        H = np.load(config.HOMOGRAPHY_FILE)["H"]
-
-    contour, mask = segment_board(img_undist)
-
-    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    base_name = os.path.splitext(os.path.basename(args.image_path))[0]
-
-    if args.debug:
-        cv2.imwrite(os.path.join(config.OUTPUT_DIR, f"{base_name}_mask.png"), mask)
-
-    if contour is None:
-        print("No board detected. Run with --debug and check the saved mask - "
-              "tune config.BACKGROUND_HSV_LOWER/UPPER to your actual background color.")
-        raise SystemExit(1)
-
-    # Minimum-area rectangle around the board -> 4 corner points in pixels
-    rect = cv2.minAreaRect(contour)
-    box_px = cv2.boxPoints(rect)  # 4x2 float32
-
-    gray = cv2.cvtColor(img_undist, cv2.COLOR_BGR2GRAY)
-    box_px_refined = refine_corners_subpixel(gray, box_px)
-
-    box_mm = pixel_to_mm(H, box_px_refined)
-
-    # Side lengths of the rectangle in mm
-    side_lengths = []
-    for i in range(4):
-        p1 = box_mm[i]
-        p2 = box_mm[(i + 1) % 4]
-        side_lengths.append(float(np.linalg.norm(p2 - p1)))
-    # Opposite sides should roughly match; length = longer pair, width = shorter pair
-    length_mm = (side_lengths[0] + side_lengths[2]) / 2
-    width_mm = (side_lengths[1] + side_lengths[3]) / 2
-    if width_mm > length_mm:
-        length_mm, width_mm = width_mm, length_mm
-
-    color = sample_color_lab(img_undist, contour)
-
-    result = {
-        "source_image": os.path.abspath(args.image_path),
-        "length_mm": round(length_mm, 2),
-        "width_mm": round(width_mm, 2),
-        "corners_mm": [[round(float(x), 2), round(float(y), 2)] for x, y in box_mm],
-        "color_lab": color,
-        # Placeholder for the defect-detection model's output - wire in
-        # your YOLO/segmentation results here, in the same mm coordinate
-        # frame (map defect pixel boxes through pixel_to_mm() the same way).
-        "defects": [],
+    return {
+        "L": round(mean_lab[0], 2),
+        "a": round(mean_lab[1], 2),
+        "b": round(mean_lab[2], 2)
     }
 
-    out_path = os.path.join(config.OUTPUT_DIR, f"{base_name}_measurement.json")
-    with open(out_path, "w") as f:
-        json.dump(result, f, indent=2)
 
-    print(json.dumps(result, indent=2))
-    print(f"\nSaved to {out_path}")
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    # --------------------------------------------------------
+    # Command-line arguments
+    # --------------------------------------------------------
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "image_path"
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="save mask and overlay images"
+    )
+
+    args = parser.parse_args()
+
+    # --------------------------------------------------------
+    # Read image
+    # --------------------------------------------------------
+
+    img = cv2.imread(
+        args.image_path
+    )
+
+    if img is None:
+
+        print(
+            f"Could not read image: "
+            f"{args.image_path}"
+        )
+
+        raise SystemExit(1)
+
+    # --------------------------------------------------------
+    # Check camera calibration
+    # --------------------------------------------------------
+
+    if not os.path.exists(
+        config.CAMERA_CALIB_FILE
+    ):
+
+        print(
+            f"Missing {config.CAMERA_CALIB_FILE} "
+            "- run 1_calibrate_camera.py first."
+        )
+
+        raise SystemExit(1)
+
+    # --------------------------------------------------------
+    # Undistort image
+    # --------------------------------------------------------
+
+    img_undist = undistort(
+        img
+    )
+
+    # --------------------------------------------------------
+    # Calculate live homography
+    # --------------------------------------------------------
+
+    H, errors_mm, detected = (
+        compute_live_homography(
+            img_undist
+        )
+    )
+
+    # --------------------------------------------------------
+    # If live markers are not available,
+    # use cached homography.
+    # --------------------------------------------------------
+
+    if H is not None:
+
+        max_err = errors_mm.max()
+
+        print(
+            f"  live homography ok, "
+            f"max marker reprojection error: "
+            f"{max_err:.2f}mm"
+        )
+
+        if max_err > 2.0:
+
+            print(
+                f"  warning: {max_err:.2f}mm marker error "
+                "- check whether the rig moved."
+            )
+
+    else:
+
+        if not os.path.exists(
+            config.HOMOGRAPHY_FILE
+        ):
+
+            print(
+                "Could not detect all corner markers "
+                "and no cached homography exists."
+            )
+
+            raise SystemExit(1)
+
+        print(
+            "  warning: using cached homography."
+        )
+
+        H = np.load(
+            config.HOMOGRAPHY_FILE
+        )["H"]
+
+        # We cannot define the live workspace without
+        # detected marker centers.
+        print(
+            "ERROR: timber detection requires all "
+            "four ArUco markers to be visible."
+        )
+
+        raise SystemExit(1)
+
+    # --------------------------------------------------------
+    # Build workspace polygon
+    # --------------------------------------------------------
+
+    workspace_px = np.array(
+        [
+            detected[0],
+            detected[1],
+            detected[2],
+            detected[3]
+        ],
+        dtype=np.float32
+    )
+
+    # --------------------------------------------------------
+    # Detect timber ONLY inside workspace
+    # --------------------------------------------------------
+
+    contour, mask = segment_board(
+        img_undist,
+        workspace_px
+    )
+
+    # --------------------------------------------------------
+    # Output directory
+    # --------------------------------------------------------
+
+    os.makedirs(
+        config.OUTPUT_DIR,
+        exist_ok=True
+    )
+
+    base_name = os.path.splitext(
+        os.path.basename(
+            args.image_path
+        )
+    )[0]
+
+    # --------------------------------------------------------
+    # Save mask
+    # --------------------------------------------------------
 
     if args.debug:
-        overlay = img_undist.copy()
-        cv2.drawContours(overlay, [np.int32(box_px_refined)], -1, (0, 255, 0), 8)
-        cv2.imwrite(os.path.join(config.OUTPUT_DIR, f"{base_name}_overlay.png"), overlay)
 
+        cv2.imwrite(
+            os.path.join(
+                config.OUTPUT_DIR,
+                f"{base_name}_mask.png"
+            ),
+            mask
+        )
+
+    # --------------------------------------------------------
+    # Check timber detection
+    # --------------------------------------------------------
+
+    if contour is None:
+
+        print(
+            "No timber detected."
+        )
+
+        print(
+            "Run with --debug and inspect the mask."
+        )
+
+        raise SystemExit(1)
+
+    # ========================================================
+    # TIMBER RECTANGLE
+    # ========================================================
+
+    rect = cv2.minAreaRect(
+        contour
+    )
+
+    box_px = cv2.boxPoints(
+        rect
+    )
+
+    # --------------------------------------------------------
+    # Refine timber corners
+    # --------------------------------------------------------
+
+    gray = cv2.cvtColor(
+        img_undist,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    box_px_refined = (
+        refine_corners_subpixel(
+            gray,
+            box_px
+        )
+    )
+
+    # --------------------------------------------------------
+    # Convert timber corners to mm
+    # --------------------------------------------------------
+
+    box_mm = pixel_to_mm(
+        H,
+        box_px_refined
+    )
+
+    # --------------------------------------------------------
+    # Calculate timber side lengths
+    # --------------------------------------------------------
+
+    side_lengths = []
+
+    for i in range(4):
+
+        p1 = box_mm[i]
+
+        p2 = box_mm[
+            (i + 1) % 4
+        ]
+
+        side_lengths.append(
+            float(
+                np.linalg.norm(
+                    p2 - p1
+                )
+            )
+        )
+
+    # Average opposite sides.
+    length_mm = (
+        side_lengths[0] +
+        side_lengths[2]
+    ) / 2
+
+    width_mm = (
+        side_lengths[1] +
+        side_lengths[3]
+    ) / 2
+
+    # Ensure length is always the larger dimension.
+    if width_mm > length_mm:
+
+        length_mm, width_mm = (
+            width_mm,
+            length_mm
+        )
+
+    # --------------------------------------------------------
+    # Sample timber color
+    # --------------------------------------------------------
+
+    color = sample_color_lab(
+        img_undist,
+        contour
+    )
+
+    # ========================================================
+    # JSON RESULT
+    # ========================================================
+
+    result = {
+
+        "source_image": os.path.abspath(
+            args.image_path
+        ),
+
+        "length_mm": round(
+            length_mm,
+            2
+        ),
+
+        "width_mm": round(
+            width_mm,
+            2
+        ),
+
+        "corners_mm": [
+            [
+                round(float(x), 2),
+                round(float(y), 2)
+            ]
+            for x, y in box_mm
+        ],
+
+        "color_lab": color,
+
+        "defects": []
+    }
+
+    # --------------------------------------------------------
+    # Save JSON
+    # --------------------------------------------------------
+
+    out_path = os.path.join(
+        config.OUTPUT_DIR,
+        f"{base_name}_measurement.json"
+    )
+
+    with open(
+        out_path,
+        "w"
+    ) as f:
+
+        json.dump(
+            result,
+            f,
+            indent=2
+        )
+
+    # --------------------------------------------------------
+    # Print result
+    # --------------------------------------------------------
+
+    print(
+        json.dumps(
+            result,
+            indent=2
+        )
+    )
+
+    print(
+        f"\nSaved to {out_path}"
+    )
+
+    # ========================================================
+    # DEBUG OVERLAY
+    # ========================================================
+
+    if args.debug:
+
+        overlay = img_undist.copy()
+
+        # ----------------------------------------------------
+        # Draw ArUco workspace boundary
+        # RED = workspace
+        # ----------------------------------------------------
+
+        cv2.polylines(
+            overlay,
+            [
+                np.int32(
+                    workspace_px
+                )
+            ],
+            isClosed=True,
+            color=(0, 0, 255),
+            thickness=6
+        )
+
+        # ----------------------------------------------------
+        # Draw ArUco marker centers
+        # BLUE = marker centers
+        # ----------------------------------------------------
+
+        for marker_id in [0, 1, 2, 3]:
+
+            point = detected[
+                marker_id
+            ]
+
+            x = int(
+                round(point[0])
+            )
+
+            y = int(
+                round(point[1])
+            )
+
+            cv2.circle(
+                overlay,
+                (x, y),
+                10,
+                (255, 0, 0),
+                -1
+            )
+
+            cv2.putText(
+                overlay,
+                str(marker_id),
+                (x + 15, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (255, 0, 0),
+                2
+            )
+
+        # ----------------------------------------------------
+        # Draw detected timber rectangle
+        # GREEN = timber
+        # ----------------------------------------------------
+
+        cv2.polylines(
+            overlay,
+            [
+                np.int32(
+                    box_px_refined
+                )
+            ],
+            isClosed=True,
+            color=(0, 255, 0),
+            thickness=6
+        )
+
+        # ----------------------------------------------------
+        # Add labels
+        # ----------------------------------------------------
+
+        cv2.putText(
+            overlay,
+            "RED = ArUco workspace",
+            (30, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 0, 255),
+            2
+        )
+
+        cv2.putText(
+            overlay,
+            "GREEN = detected timber",
+            (30, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 255, 0),
+            2
+        )
+
+        # ----------------------------------------------------
+        # Save overlay
+        # ----------------------------------------------------
+
+        overlay_path = os.path.join(
+            config.OUTPUT_DIR,
+            f"{base_name}_overlay.png"
+        )
+
+        cv2.imwrite(
+            overlay_path,
+            overlay
+        )
+
+        print(
+            f"Debug overlay saved to {overlay_path}"
+        )
+
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
     main()
