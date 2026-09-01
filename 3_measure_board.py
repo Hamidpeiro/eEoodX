@@ -48,13 +48,41 @@ def segment_board(img):
     return largest, board_mask
 
 
+# def refine_corners_subpixel(img_gray, corners):
+#     """cv2.cornerSubPix expects float32 points and a small search window."""
+#     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
+#     pts = corners.reshape(-1, 1, 2).astype(np.float32)
+#     refined = cv2.cornerSubPix(img_gray, pts, (5, 5), (-1, -1), criteria)
+#     return refined.reshape(-1, 2)
 def refine_corners_subpixel(img_gray, corners):
-    """cv2.cornerSubPix expects float32 points and a small search window."""
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
-    pts = corners.reshape(-1, 1, 2).astype(np.float32)
-    refined = cv2.cornerSubPix(img_gray, pts, (5, 5), (-1, -1), criteria)
-    return refined.reshape(-1, 2)
+    """Refine rectangle corners to sub-pixel accuracy.
 
+    cornerSubPix requires all initial points to be inside the image,
+    so we clamp the points before refinement.
+    """
+    criteria = (
+        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+        30,
+        0.01
+    )
+
+    pts = corners.reshape(-1, 1, 2).astype(np.float32)
+
+    height, width = img_gray.shape[:2]
+
+    # Keep points inside the image.
+    pts[:, 0, 0] = np.clip(pts[:, 0, 0], 0, width - 1)
+    pts[:, 0, 1] = np.clip(pts[:, 0, 1], 0, height - 1)
+
+    refined = cv2.cornerSubPix(
+        img_gray,
+        pts,
+        (5, 5),
+        (-1, -1),
+        criteria
+    )
+
+    return refined.reshape(-1, 2)
 
 def pixel_to_mm(H, pts_px):
     pts_px = np.array(pts_px, dtype=np.float32).reshape(-1, 1, 2)

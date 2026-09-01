@@ -27,9 +27,9 @@ PIXEL_SIZE_UM = 2.4  # sensor physical pixel pitch, from datasheet
 # ---------------------------------------------------------------------------
 # Checkerboard used for intrinsic (lens distortion) calibration
 # ---------------------------------------------------------------------------
-# INNER corners, not squares. A "9x6 squares" board has 8x5 inner corners.
-CHECKERBOARD_INNER_CORNERS = (8, 5)
-CHECKERBOARD_SQUARE_SIZE_MM = 25.0  # measure your printed squares with calipers
+# INNER corners, not squares. A "14x9 squares" board has 13x8 inner corners.
+CHECKERBOARD_INNER_CORNERS = (13, 8)
+CHECKERBOARD_SQUARE_SIZE_MM = 20.0  # measure your printed squares with calipers
 
 # ---------------------------------------------------------------------------
 # Workspace / homography (ArUco markers at the 4 known table corners)
@@ -44,9 +44,9 @@ ARUCO_MARKER_SIZE_MM = 100.0  # physical printed size of each marker's black squ
 # the board will be laid in.
 MARKER_WORLD_POSITIONS_MM = {
     0: (0.0, 0.0),        # top-left
-    1: (1200.0, 0.0),     # top-right
-    2: (1200.0, 800.0),   # bottom-right
-    3: (0.0, 800.0),      # bottom-left
+    1: (780.0, 0.0),     # top-right
+    2: (780.0, 457.0),   # bottom-right
+    3: (0.0, 457.0),      # bottom-left
 }
 
 # ---------------------------------------------------------------------------

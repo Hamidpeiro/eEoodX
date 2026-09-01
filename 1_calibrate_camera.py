@@ -77,8 +77,8 @@ for path in image_paths:
     print(f"  ok: {os.path.basename(path)}")
 
 print(f"\nAccepted {accepted}/{len(image_paths)} photos.")
-if accepted < 10:
-    print("Fewer than 10 good photos - calibration will be unreliable. "
+if accepted < 5:
+    print("Fewer than 5 good photos - calibration will be unreliable. "
           "Add more photos covering different areas of the frame.")
 
 ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
