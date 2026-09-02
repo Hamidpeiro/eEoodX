@@ -1,0 +1,30 @@
+{
+  "timber_id": 2,
+  "source_image": "c:\\Users\\hamid\\Documents\\GitHub\\eEoodX\\sample_output\\captures\\timber_02.jpg",
+  "length_mm": 521.5,
+  "width_mm": 136.84,
+  "corners_mm": [
+    [
+      179.39,
+      213.0
+    ],
+    [
+      690.64,
+      321.89
+    ],
+    [
+      662.04,
+      453.47
+    ],
+    [
+      152.28,
+      349.36
+    ]
+  ],
+  "color_lab": {
+    "L": 80.17,
+    "a": 134.86,
+    "b": 135.62
+  },
+  "defects": []
+}
