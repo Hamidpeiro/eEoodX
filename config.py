@@ -45,10 +45,10 @@ ARUCO_MARKER_SIZE_MM = 100.0  # physical printed size of each marker's black squ
 # Order/layout suggestion: place markers roughly at the 4 corners of the area
 # the board will be laid in.
 MARKER_WORLD_POSITIONS_MM = {
-    0: (0.0, 0.0),        # top-left
-    1: (776.0, 0.0),     # top-right
-    2: (776.0, 440.0),   # bottom-right
-    3: (0.0, 440.0),      # bottom-left
+    2: (0.0, 0.0),        # top-left
+    3: (776.0, 0.0),      # top-right
+    0: (776.0, 440.0),    # bottom-right
+    1: (0.0, 440.0),      # bottom-left
 }
 
 # ---------------------------------------------------------------------------
