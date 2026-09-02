@@ -81,43 +81,65 @@ def segment_board(img, workspace_px):
         255
     )
 
-    # --------------------------------------------------------
-    # HSV
-    # --------------------------------------------------------
+    # ========================================================
+    # 1. COLOR-BASED FOREGROUND SEGMENTATION
+    # ========================================================
 
     hsv = cv2.cvtColor(
         img,
         cv2.COLOR_BGR2HSV
     )
 
-    # --------------------------------------------------------
-    # Background
-    # --------------------------------------------------------
+    h, s, v = cv2.split(hsv)
 
-    bg_mask = cv2.inRange(
-        hsv,
-        config.BACKGROUND_HSV_LOWER,
-        config.BACKGROUND_HSV_UPPER
+    # Timber is generally more saturated and darker than
+    # the light workspace.
+    #
+    # This avoids treating the white/grey workspace as timber.
+    color_mask = (
+        (s > 25) &
+        (v < 235)
+    ).astype(np.uint8) * 255
+
+    # ========================================================
+    # 2. DARK OBJECT MASK
+    # ========================================================
+
+    gray = cv2.cvtColor(
+        img,
+        cv2.COLOR_BGR2GRAY
     )
 
-    board_mask = cv2.bitwise_not(
-        bg_mask
+    dark_mask = cv2.inRange(
+        gray,
+        0,
+        150
     )
 
-    # --------------------------------------------------------
-    # Workspace only
-    # --------------------------------------------------------
+    # Combine color and dark information.
+    board_mask = cv2.bitwise_or(
+        color_mask,
+        dark_mask
+    )
+
+    # ========================================================
+    # 3. KEEP ONLY WORKSPACE
+    # ========================================================
 
     board_mask = cv2.bitwise_and(
         board_mask,
         workspace_mask
     )
 
-    # --------------------------------------------------------
-    # Remove ArUco markers
-    # --------------------------------------------------------
+    # ========================================================
+    # 4. REMOVE ARUCO CORNER AREAS
+    # ========================================================
 
-    marker_radius = 70
+    # The markers are located at the four workspace corners.
+    # Remove a larger region around each one so that marker
+    # edges cannot become candidate contours.
+
+    marker_radius = 140
 
     for point in workspace_px:
 
@@ -132,30 +154,35 @@ def segment_board(img, workspace_px):
             -1
         )
 
-    # --------------------------------------------------------
-    # Morphological cleanup
-    # --------------------------------------------------------
+    # ========================================================
+    # 5. MORPHOLOGICAL CLEANUP
+    # ========================================================
 
-    kernel = np.ones(
-        (15, 15),
-        dtype=np.uint8
+    open_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (9, 9)
+    )
+
+    close_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (21, 21)
     )
 
     board_mask = cv2.morphologyEx(
         board_mask,
         cv2.MORPH_OPEN,
-        kernel
+        open_kernel
     )
 
     board_mask = cv2.morphologyEx(
         board_mask,
         cv2.MORPH_CLOSE,
-        kernel
+        close_kernel
     )
 
-    # --------------------------------------------------------
-    # Find contours
-    # --------------------------------------------------------
+    # ========================================================
+    # 6. FIND CONTOURS
+    # ========================================================
 
     contours, _ = cv2.findContours(
         board_mask,
@@ -166,38 +193,136 @@ def segment_board(img, workspace_px):
     if not contours:
         return None, board_mask
 
-    # --------------------------------------------------------
-    # Filter small contours
-    # --------------------------------------------------------
+    # ========================================================
+    # 7. SCORE CANDIDATE TIMBERS
+    # ========================================================
 
-    valid_contours = []
+    candidates = []
 
     for contour in contours:
 
-        area = cv2.contourArea(
-            contour
+        area = cv2.contourArea(contour)
+
+        # Ignore tiny objects.
+        if area < config.MIN_BOARD_CONTOUR_AREA_PX:
+            continue
+
+        # ----------------------------------------------------
+        # Minimum-area rectangle
+        # ----------------------------------------------------
+
+        rect = cv2.minAreaRect(contour)
+
+        rect_w = rect[1][0]
+        rect_h = rect[1][1]
+
+        if rect_w <= 1 or rect_h <= 1:
+            continue
+
+        rect_area = rect_w * rect_h
+
+        # ----------------------------------------------------
+        # Rectangularity
+        #
+        # A perfect rectangle approaches 1.0.
+        # Irregular shadows/background shapes are lower.
+        # ----------------------------------------------------
+
+        rectangularity = area / rect_area
+
+        # ----------------------------------------------------
+        # Solidity
+        #
+        # Area / convex hull area.
+        # A solid timber should be relatively high.
+        # ----------------------------------------------------
+
+        hull = cv2.convexHull(contour)
+
+        hull_area = cv2.contourArea(hull)
+
+        if hull_area <= 1:
+            continue
+
+        solidity = area / hull_area
+
+        # ----------------------------------------------------
+        # Aspect ratio
+        # ----------------------------------------------------
+
+        aspect_ratio = max(
+            rect_w,
+            rect_h
+        ) / min(
+            rect_w,
+            rect_h
         )
 
-        if area >= config.MIN_BOARD_CONTOUR_AREA_PX:
+        # Timber should normally be elongated.
+        if aspect_ratio < 1.5:
+            continue
 
-            valid_contours.append(
-                contour
+        # ----------------------------------------------------
+        # Candidate score
+        # ----------------------------------------------------
+
+        score = (
+            area
+            * rectangularity
+            * solidity
+        )
+
+        candidates.append(
+            (
+                score,
+                contour,
+                area,
+                rectangularity,
+                solidity,
+                aspect_ratio
             )
+        )
 
-    if not valid_contours:
+    # ========================================================
+    # 8. NO VALID TIMBER
+    # ========================================================
+
+    if not candidates:
         return None, board_mask
 
-    # --------------------------------------------------------
-    # One timber at a time:
-    # select largest contour
-    # --------------------------------------------------------
+    # ========================================================
+    # 9. SELECT BEST TIMBER
+    # ========================================================
 
-    largest = max(
-        valid_contours,
-        key=cv2.contourArea
+    candidates.sort(
+        key=lambda item: item[0],
+        reverse=True
     )
 
-    return largest, board_mask
+    (
+        best_score,
+        best_contour,
+        best_area,
+        best_rectangularity,
+        best_solidity,
+        best_aspect_ratio
+    ) = candidates[0]
+
+    print("\nTimber segmentation candidate:")
+    print(
+        f"  Area:           {best_area:.0f} px"
+    )
+    print(
+        f"  Rectangularity: {best_rectangularity:.3f}"
+    )
+    print(
+        f"  Solidity:       {best_solidity:.3f}"
+    )
+    print(
+        f"  Aspect ratio:   {best_aspect_ratio:.2f}"
+    )
+
+    return best_contour, board_mask
 
 
 # ============================================================
