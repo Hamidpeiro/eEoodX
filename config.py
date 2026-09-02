@@ -14,6 +14,8 @@ CALIB_DIR = os.path.join(BASE_DIR, "calibration_data")
 CAMERA_CALIB_FILE = os.path.join(CALIB_DIR, "camera_intrinsics.npz")
 HOMOGRAPHY_FILE = os.path.join(CALIB_DIR, "homography.npz")
 OUTPUT_DIR = os.path.join(BASE_DIR, "sample_output")
+# All captured timber images, debug images and measurement JSON files # are stored here. 
+CAPTURE_DIR = os.path.join( OUTPUT_DIR, "captures" )
 
 # ---------------------------------------------------------------------------
 # Camera (Arducam B0477 / IMX283)
