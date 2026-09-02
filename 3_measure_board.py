@@ -365,16 +365,22 @@ def compute_live_homography(img_undist):
 
     detected = {}
 
+    outer_corner_index = {
+        0: 0,  # top-left marker → top-left corner
+        1: 1,  # top-right marker → top-right corner
+        2: 2,  # bottom-right marker → bottom-right corner
+        3: 3,  # bottom-left marker → bottom-left corner
+    }
+
     for marker_id, marker_corners in zip(
         ids,
         corners
     ):
+        corner_index = outer_corner_index[int(marker_id)]
 
-        center = marker_corners[0].mean(
-            axis=0
+        detected[int(marker_id)] = (
+            marker_corners[0][corner_index]
         )
-
-        detected[int(marker_id)] = center
 
     # --------------------------------------------------------
     # 5. Check required marker IDs

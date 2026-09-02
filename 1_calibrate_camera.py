@@ -98,3 +98,25 @@ np.savez(
     rms_error=ret,
 )
 print(f"\nSaved to {config.CAMERA_CALIB_FILE}")
+
+# Save the same calibration data as a human-readable TXT file
+txt_file = os.path.splitext(config.CAMERA_CALIB_FILE)[0] + ".txt"
+
+with open(txt_file, "w") as f:
+    f.write("CAMERA INTRINSIC CALIBRATION\n")
+    f.write("=" * 50 + "\n\n")
+
+    f.write(f"Calibration file: {config.CAMERA_CALIB_FILE}\n")
+    f.write(f"Number of accepted photos: {accepted}\n")
+    f.write(f"Image size: {image_size}\n")
+    f.write(f"RMS reprojection error: {ret:.6f} px\n\n")
+
+    f.write("Camera Matrix:\n")
+    f.write(np.array2string(camera_matrix, precision=8))
+    f.write("\n\n")
+
+    f.write("Distortion Coefficients:\n")
+    f.write(np.array2string(dist_coeffs.ravel(), precision=8))
+    f.write("\n")
+
+print(f"Saved human-readable calibration to {txt_file}")

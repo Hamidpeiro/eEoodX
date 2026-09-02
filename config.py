@@ -44,9 +44,9 @@ ARUCO_MARKER_SIZE_MM = 100.0  # physical printed size of each marker's black squ
 # the board will be laid in.
 MARKER_WORLD_POSITIONS_MM = {
     0: (0.0, 0.0),        # top-left
-    1: (770.0, 0.0),     # top-right
-    2: (770.0, 447.0),   # bottom-right
-    3: (0.0, 447.0),      # bottom-left
+    1: (776.0, 0.0),     # top-right
+    2: (776.0, 440.0),   # bottom-right
+    3: (0.0, 440.0),      # bottom-left
 }
 
 # ---------------------------------------------------------------------------
@@ -56,7 +56,7 @@ MARKER_WORLD_POSITIONS_MM = {
 # mat). We threshold in HSV. Tune these ranges to your actual mat color by
 # running measure_board.py with --debug and looking at the mask.
 BACKGROUND_HSV_LOWER = (0, 0, 0)
-BACKGROUND_HSV_UPPER = (180, 60, 80)  # tune this: covers dark, low-saturation mat
+BACKGROUND_HSV_UPPER = (180, 15, 255)  # tune this: covers dark, low-saturation mat
 
 MIN_BOARD_CONTOUR_AREA_PX = 5000  # ignore small noise blobs after thresholding
 

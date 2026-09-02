@@ -1,0 +1,30 @@
+WORKSPACE HOMOGRAPHY CALIBRATION
+==================================================
+
+Workspace image: c:\Users\hamid\Documents\GitHub\eEoodX\calibration_data\workspace_photos\workspace.jpg
+
+Detected marker IDs:
+[0, 1, 2, 3]
+
+Pixel points (outer marker corners):
+[[1239.  705.]
+ [  21.  707.]
+ [  34.   20.]
+ [1234.   18.]]
+
+World points (mm):
+[[  0.   0.]
+ [776.   0.]
+ [776. 440.]
+ [  0. 440.]]
+
+Homography matrix H:
+[[-6.4694293388e-01  4.7084638565e-03  7.9824282806e+02]
+ [-1.0521627151e-03 -6.4076709351e-01  4.5304443053e+02]
+ [ 7.2277111327e-08  2.1844756714e-05  1.0000000000e+00]]
+
+Reprojection errors (mm):
+Marker 0: 0.000000 mm
+Marker 1: 0.000000 mm
+Marker 2: 0.000000 mm
+Marker 3: 0.000000 mm

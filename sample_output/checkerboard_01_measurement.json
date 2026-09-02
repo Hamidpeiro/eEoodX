@@ -1,29 +1,29 @@
 {
-  "source_image": "C:\\Users\\hamid\\Documents\\GitHub\\eEoodX\\Photo\\checkerboard_01.jpg",
-  "length_mm": 776.08,
-  "width_mm": 447.74,
+  "source_image": "C:\\Users\\hamid\\Documents\\GitHub\\eEoodX\\checkerboard_01.jpg",
+  "length_mm": 590.95,
+  "width_mm": 167.22,
   "corners_mm": [
     [
-      0.41,
-      0.27
+      643.91,
+      -7.79
     ],
     [
-      769.37,
-      0.9
+      729.2,
+      110.72
     ],
     [
-      772.51,
-      446.99
+      191.05,
+      380.32
     ],
     [
-      -10.68,
-      449.49
+      107.04,
+      211.66
     ]
   ],
   "color_lab": {
-    "L": 252.58,
-    "a": 127.85,
-    "b": 128.32
+    "L": 72.73,
+    "a": 134.36,
+    "b": 132.79
   },
   "defects": []
 }

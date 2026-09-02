@@ -1,0 +1,16 @@
+CAMERA INTRINSIC CALIBRATION
+==================================================
+
+Calibration file: c:\Users\hamid\Documents\GitHub\eEoodX\calibration_data\camera_intrinsics.npz
+Number of accepted photos: 7
+Image size: (1280, 720)
+RMS reprojection error: 0.075470 px
+
+Camera Matrix:
+[[2.81332177e+03 0.00000000e+00 6.34555399e+02]
+ [0.00000000e+00 2.81325807e+03 3.58798565e+02]
+ [0.00000000e+00 0.00000000e+00 1.00000000e+00]]
+
+Distortion Coefficients:
+[-2.06592655e-01  1.77176459e-01  4.67317422e-04  5.47728850e-04
+ -1.17043599e+00]
