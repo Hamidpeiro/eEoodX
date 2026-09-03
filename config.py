@@ -40,15 +40,16 @@ ARUCO_DICT = "DICT_4X4_50"
 ARUCO_MARKER_SIZE_MM = 100.0  # physical printed size of each marker's black square
 
 # Marker ID -> real-world (X, Y) position in millimetres on your table plane.
-# Origin (0,0) is your choice - e.g. one corner of the table. Measure these
-# by hand with a tape measure once, they don't change unless you move the rig.
-# Order/layout suggestion: place markers roughly at the 4 corners of the area
-# the board will be laid in.
+# Standard CAD / Rhino / Grasshopper coordinate system:
+# - Origin (0,0) at Bottom-Left (Marker 1)
+# - +X axis along table length towards Bottom-Right (Marker 0)
+# - +Y axis along table width towards Top-Left (Marker 2)
+# - (+X, +Y) at Top-Right (Marker 3)
 MARKER_WORLD_POSITIONS_MM = {
-    2: (0.0, 0.0),        # top-left
-    3: (776.0, 0.0),      # top-right
-    0: (776.0, 440.0),    # bottom-right
-    1: (0.0, 440.0),      # bottom-left
+    1: (0.0, 0.0),        # bottom-left (Origin)
+    0: (776.0, 0.0),      # bottom-right (+X)
+    2: (0.0, 440.0),      # top-left (+Y)
+    3: (776.0, 440.0),    # top-right (+X, +Y)
 }
 
 # ---------------------------------------------------------------------------

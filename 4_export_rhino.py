@@ -7,10 +7,6 @@ Features:
     - Preserves timber color (dedicated Rhino layer and object attributes per timber with RGB color).
     - Annotates with TextDot containing Dimensions, Surface Area (cm² / mm²), Thickness, and Color.
     - Saves directly to sample_output/boards.3dm.
-
-Usage:
-    python 4_export_rhino.py                                      # Opens file picker window
-    python 4_export_rhino.py sample_output/captures/timber_08_measurement.json
 """
 
 import os
@@ -131,6 +127,48 @@ def add_timber_to_model(model, data, index=0, z_offset=0.0):
     return True
 
 
+def add_workspace_to_model(model, data):
+    """Add workspace boundary and ArUco markers to the Rhino model."""
+    layer = rhino3dm.Layer()
+    layer.Name = "Workspace_Table"
+    layer.Color = (100, 100, 100, 255)
+    layer_index = model.Layers.Add(layer)
+
+    attr = rhino3dm.ObjectAttributes()
+    attr.LayerIndex = layer_index
+    attr.ColorSource = rhino3dm.ObjectColorSource.ColorFromLayer
+    attr.Name = "Table_Boundary"
+
+    # Outer table boundary rectangle from config
+    m1 = config.MARKER_WORLD_POSITIONS_MM.get(1, (0.0, 0.0))
+    m0 = config.MARKER_WORLD_POSITIONS_MM.get(0, (776.0, 0.0))
+    m3 = config.MARKER_WORLD_POSITIONS_MM.get(3, (776.0, 440.0))
+    m2 = config.MARKER_WORLD_POSITIONS_MM.get(2, (0.0, 440.0))
+
+    pts = [
+        rhino3dm.Point3d(float(m1[0]), float(m1[1]), 0.0),
+        rhino3dm.Point3d(float(m0[0]), float(m0[1]), 0.0),
+        rhino3dm.Point3d(float(m3[0]), float(m3[1]), 0.0),
+        rhino3dm.Point3d(float(m2[0]), float(m2[1]), 0.0),
+        rhino3dm.Point3d(float(m1[0]), float(m1[1]), 0.0),
+    ]
+    model.Objects.AddCurve(rhino3dm.Polyline(pts).ToPolylineCurve(), attr)
+
+    # ArUco marker squares and label text dots
+    markers = data.get("markers_world_mm", {})
+    for m_id, m_info in markers.items():
+        if "corners_mm" in m_info and len(m_info["corners_mm"]) == 4:
+            c_pts = [rhino3dm.Point3d(float(x), float(y), 0.0) for x, y in m_info["corners_mm"]]
+            c_pts.append(c_pts[0])
+            m_attr = rhino3dm.ObjectAttributes()
+            m_attr.LayerIndex = layer_index
+            m_attr.Name = f"ArUco_Marker_{m_id}"
+            model.Objects.AddCurve(rhino3dm.Polyline(c_pts).ToPolylineCurve(), m_attr)
+        if "center_mm" in m_info:
+            cx, cy = m_info["center_mm"]
+            model.Objects.AddTextDot(f"ArUco {m_id}", rhino3dm.Point3d(float(cx), float(cy), 0.0), attr)
+
+
 def main():
     # If file paths are provided on command line, use them; otherwise open file picker
     if len(sys.argv) > 1:
@@ -152,6 +190,7 @@ def main():
     model.Settings.ModelUnitSystem = rhino3dm.UnitSystem.Millimeters
 
     success_count = 0
+    workspace_added = False
     for i, json_path in enumerate(json_files):
         if not os.path.exists(json_path):
             print(f"  ERROR: File not found: {json_path}")
@@ -163,6 +202,10 @@ def main():
             except Exception as e:
                 print(f"  ERROR reading {json_path}: {e}")
                 continue
+
+        if not workspace_added:
+            add_workspace_to_model(model, data)
+            workspace_added = True
 
         ok = add_timber_to_model(model, data, index=i)
         if ok:

@@ -286,7 +286,7 @@ def pixel_to_mm(H, pts_px):
 def compute_live_homography(img_undist):
     """
     Detect all 4 ArUco markers and dynamically identify:
-        - Outer corners: for high-accuracy pixel -> mm homography and outer workspace
+    - Outer corners: for high-accuracy pixel -> mm homography and outer workspace
     """
     aruco_dict = cv2.aruco.getPredefinedDictionary(
         getattr(cv2.aruco, config.ARUCO_DICT)
@@ -298,7 +298,7 @@ def compute_live_homography(img_undist):
     corners, ids, _ = detector.detectMarkers(gray)
 
     if ids is None:
-        print("  WARNING: no ArUco markers detected.")
+        print(" WARNING: no ArUco markers detected.")
         return None, None, None, None, None
 
     ids = ids.flatten()
@@ -311,7 +311,7 @@ def compute_live_homography(img_undist):
 
     if not expected_ids.issubset(detected_ids):
         missing = expected_ids - detected_ids
-        print(f"  WARNING: markers not all visible (missing {missing})")
+        print(f" WARNING: markers not all visible (missing {missing})")
         return None, None, None, None, None
 
     # Compute centroid of all 4 markers
@@ -321,44 +321,42 @@ def compute_live_homography(img_undist):
     # Dynamically find outer corners based on distance to workspace centroid
     detected_outer = {}
     detected_inner = {}
-
     for m_id in expected_ids:
         pts = detected_all[m_id]
         dists = np.linalg.norm(pts - ws_centroid, axis=1)
         detected_inner[m_id] = pts[np.argmin(dists)]
         detected_outer[m_id] = pts[np.argmax(dists)]
 
-    # Homography correspondences
+    # Map each detected marker's outer corner directly to its configured real-world position in mm
+    # e.g. Marker 1 (Bottom-Left Origin) -> (0, 0), Marker 0 (Bottom-Right) -> (776, 0), Marker 2 (Top-Left) -> (0, 440), Marker 3 (Top-Right) -> (776, 440)
     pixel_pts = []
     world_pts = []
+    marker_order = [1, 0, 2, 3] if {1, 0, 2, 3}.issubset(expected_ids) else list(expected_ids)
 
-    for marker_id, world_xy in config.MARKER_WORLD_POSITIONS_MM.items():
+    for marker_id in marker_order:
         pixel_pts.append(detected_outer[marker_id])
-        world_pts.append(world_xy)
+        world_pts.append(config.MARKER_WORLD_POSITIONS_MM[marker_id])
 
     pixel_pts = np.asarray(pixel_pts, dtype=np.float32)
     world_pts = np.asarray(world_pts, dtype=np.float32)
 
     H, _ = cv2.findHomography(pixel_pts, world_pts, method=0)
     if H is None:
-        print("  WARNING: could not calculate homography.")
+        print(" WARNING: could not calculate homography.")
         return None, None, None, None, None
 
     reprojected = cv2.perspectiveTransform(
         pixel_pts.reshape(-1, 1, 2),
         H
     ).reshape(-1, 2)
-
     errors_mm = np.linalg.norm(reprojected - world_pts, axis=1)
 
     print("\nArUco marker positions in world coordinates:")
-    for marker_id, point in zip(config.MARKER_WORLD_POSITIONS_MM.keys(), reprojected):
+    for marker_id, point in zip(marker_order, reprojected):
         print(f"  Marker {marker_id}: X={point[0]:.2f} mm, Y={point[1]:.2f} mm")
-
     print(f"\n  Maximum marker reprojection error: {errors_mm.max():.4f} mm")
 
     return H, errors_mm, detected_outer, detected_inner, detected_all
-
 
 # ============================================================
 # COLOR SAMPLING
@@ -424,12 +422,9 @@ def measure_timber(img, image_path, timber_number, timber_thickness_mm=0.0):
         print(f"WARNING: marker error is high ({max_err:.2f} mm).")
 
     # Physical workspace order: TL (2) -> TR (3) -> BR (0) -> BL (1)
-    workspace_outer_px = np.array([
-        detected_outer[2],
-        detected_outer[3],
-        detected_outer[0],
-        detected_outer[1]
-    ], dtype=np.float32)
+    workspace_outer_px = order_quad(
+        np.array([detected_outer[m] for m in [0, 1, 2, 3]], dtype=np.float32)
+    )
 
     contour, mask, timber_corners_px = segment_board(
         img_undist,
@@ -500,10 +495,40 @@ def measure_timber(img, image_path, timber_number, timber_thickness_mm=0.0):
     # Sample color (LAB + RGB + HEX)
     color_info = sample_timber_color(img_undist, contour)
 
+    # Calculate detected ArUco marker centers and corners in real-world mm
+    marker_order = [1, 0, 2, 3] if {1, 0, 2, 3}.issubset(detected_all.keys()) else list(detected_all.keys())
+    markers_info = {}
+    for m_id in marker_order:
+        m_corners_px = detected_all[m_id]
+        m_corners_mm = pixel_to_mm(H, m_corners_px)
+        m_center_px = m_corners_px.mean(axis=0)
+        m_center_mm = pixel_to_mm(H, [m_center_px])[0]
+        m_outer_mm = pixel_to_mm(H, [detected_outer[m_id]])[0]
+        markers_info[str(m_id)] = {
+            "outer_corner_mm": [round(float(m_outer_mm[0]), 2), round(float(m_outer_mm[1]), 2)],
+            "center_mm": [round(float(m_center_mm[0]), 2), round(float(m_center_mm[1]), 2)],
+            "corners_mm": [[round(float(pt[0]), 2), round(float(pt[1]), 2)] for pt in m_corners_mm]
+        }
+
+    # Reference Frame definition based on Marker 1 as Origin (0,0,0) (CAD / Rhino standard)
+    # +X points along table length towards Marker 0
+    # +Y points across table width towards Marker 2
+    # +Z points normal to table upwards
+    reference_frame = {
+        "origin_marker_id": 1,
+        "origin_mm": [0.0, 0.0, 0.0],
+        "x_axis": [1.0, 0.0, 0.0],
+        "y_axis": [0.0, 1.0, 0.0],
+        "z_axis": [0.0, 0.0, 1.0],
+        "description": "Origin (0,0,0) at Marker 1 outer corner (Bottom-Left); +X towards Marker 0; +Y towards Marker 2"
+    }
+
     # Build JSON result
     result = {
         "timber_id": timber_number,
         "source_image": os.path.abspath(image_path),
+        "reference_frame": reference_frame,
+        "markers_world_mm": markers_info,
         "length_mm": round(length_mm, 2),
         "width_mm": round(width_mm, 2),
         "surface_area_mm2": round(float(surface_area_mm2), 2),
