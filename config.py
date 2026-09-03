@@ -74,6 +74,13 @@ BACKGROUND_HSV_UPPER = (180, 15, 255)  # tune this: covers dark, low-saturation 
 MIN_BOARD_CONTOUR_AREA_PX = 5000  # ignore small noise blobs after thresholding
 
 # ---------------------------------------------------------------------------
+# Contour Approximation (Smoothing & Simplification)
+# ---------------------------------------------------------------------------
+# Epsilon = CONTOUR_APPROX_FACTOR * arcLength (OpenCV cv2.approxPolyDP)
+# 0.001 smoothly simplifies contour and removes pixel noise while keeping organic curves.
+CONTOUR_APPROX_FACTOR = 0.004
+
+# ---------------------------------------------------------------------------
 # Color reference chart (optional but recommended)
 # ---------------------------------------------------------------------------
 # If you place a color checker in frame, set this True and fill in the pixel

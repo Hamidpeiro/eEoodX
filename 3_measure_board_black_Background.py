@@ -139,9 +139,9 @@ def refine_corners_subpixel(img_gray, corners):
 # BLACK BACKGROUND / TIMBER SEGMENTATION
 # ============================================================
 
-def segment_board(img, workspace_outer_px, markers_dict=None):
+def segment_board(img, workspace_outer_px, markers_dict=None, verbose=True):
     """
-    Detect and segment timber on a black background.
+    Segment timber placed on a black background / curtain inside the ArUco workspace.
 
     Strategy:
         1. Limit analysis to the full workspace defined by outer ArUco marker corners.
@@ -171,7 +171,8 @@ def segment_board(img, workspace_outer_px, markers_dict=None):
 
     roi_pixels = gray_blur[usable_roi > 0]
     if roi_pixels.size < 100:
-        print("  ERROR: Usable workspace is too small.")
+        if verbose:
+            print("  ERROR: Usable workspace is too small.")
         return None, np.zeros_like(gray), None
 
     # Compute dark/background threshold
@@ -183,9 +184,10 @@ def segment_board(img, workspace_outer_px, markers_dict=None):
     )
     black_threshold = int(np.clip(otsu_thresh, 35, 120))
 
-    print(f"\nBlack-background segmentation:")
-    print(f"  Otsu threshold: {otsu_thresh:.1f}")
-    print(f"  Applied threshold: {black_threshold}")
+    if verbose:
+        print(f"\nBlack-background segmentation:")
+        print(f"  Otsu threshold: {otsu_thresh:.1f}")
+        print(f"  Applied threshold: {black_threshold}")
 
     # Binary mask of dark black curtain pixels inside the ROI
     dark_mask = np.zeros_like(gray)
@@ -220,7 +222,8 @@ def segment_board(img, workspace_outer_px, markers_dict=None):
     # Find timber candidates
     contours, _ = cv2.findContours(timber_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        print("  ERROR: No foreground contour found.")
+        if verbose:
+            print("  ERROR: No foreground contour found.")
         return None, timber_mask, None
 
     min_area = getattr(config, "MIN_BOARD_CONTOUR_AREA_PX", 3000)
@@ -250,17 +253,19 @@ def segment_board(img, workspace_outer_px, markers_dict=None):
         candidates.append((score, contour, area, aspect_ratio, solidity))
 
     if not candidates:
-        print("  ERROR: No suitable timber contour found.")
+        if verbose:
+            print("  ERROR: No suitable timber contour found.")
         return None, timber_mask, None
 
     candidates.sort(key=lambda item: item[0], reverse=True)
     score, best_contour, area, aspect_ratio, solidity = candidates[0]
 
-    print(f"\nTimber candidate:")
-    print(f"  Area:         {area:.0f} px")
-    print(f"  Aspect ratio: {aspect_ratio:.2f}")
-    print(f"  Solidity:     {solidity:.3f}")
-    print(f"  Score:        {score:.0f}")
+    if verbose:
+        print(f"\nTimber candidate:")
+        print(f"  Area:         {area:.0f} px")
+        print(f"  Aspect ratio: {aspect_ratio:.2f}")
+        print(f"  Solidity:     {solidity:.3f}")
+        print(f"  Score:        {score:.0f}")
 
     # Extract tightly fitted bounding box matching the exact yellow contour
     timber_corners_px = get_contour_oriented_box(best_contour)
@@ -283,7 +288,7 @@ def pixel_to_mm(H, pts_px):
 # LIVE ARUCO HOMOGRAPHY
 # ============================================================
 
-def compute_live_homography(img_undist):
+def compute_live_homography(img_undist, verbose=True):
     """
     Detect all 4 ArUco markers and dynamically identify:
     - Outer corners: for high-accuracy pixel -> mm homography and outer workspace
@@ -298,7 +303,8 @@ def compute_live_homography(img_undist):
     corners, ids, _ = detector.detectMarkers(gray)
 
     if ids is None:
-        print(" WARNING: no ArUco markers detected.")
+        if verbose:
+            print(" WARNING: no ArUco markers detected.")
         return None, None, None, None, None
 
     ids = ids.flatten()
@@ -311,7 +317,8 @@ def compute_live_homography(img_undist):
 
     if not expected_ids.issubset(detected_ids):
         missing = expected_ids - detected_ids
-        print(f" WARNING: markers not all visible (missing {missing})")
+        if verbose:
+            print(f" WARNING: markers not all visible (missing {missing})")
         return None, None, None, None, None
 
     # Compute centroid of all 4 markers
@@ -342,7 +349,8 @@ def compute_live_homography(img_undist):
 
     H, _ = cv2.findHomography(pixel_pts, world_pts, method=0)
     if H is None:
-        print(" WARNING: could not calculate homography.")
+        if verbose:
+            print(" WARNING: could not calculate homography.")
         return None, None, None, None, None
 
     reprojected = cv2.perspectiveTransform(
@@ -351,10 +359,11 @@ def compute_live_homography(img_undist):
     ).reshape(-1, 2)
     errors_mm = np.linalg.norm(reprojected - world_pts, axis=1)
 
-    print("\nArUco marker positions in world coordinates:")
-    for marker_id, point in zip(marker_order, reprojected):
-        print(f"  Marker {marker_id}: X={point[0]:.2f} mm, Y={point[1]:.2f} mm")
-    print(f"\n  Maximum marker reprojection error: {errors_mm.max():.4f} mm")
+    if verbose:
+        print("\nArUco marker positions in world coordinates:")
+        for marker_id, point in zip(marker_order, reprojected):
+            print(f"  Marker {marker_id}: X={point[0]:.2f} mm, Y={point[1]:.2f} mm")
+        print(f"\n  Maximum marker reprojection error: {errors_mm.max():.4f} mm")
 
     return H, errors_mm, detected_outer, detected_inner, detected_all
 
@@ -445,9 +454,19 @@ def measure_timber(img, image_path, timber_number, timber_thickness_mm=0.0):
     # Pixel -> mm mapping for corners
     corners_mm_table = pixel_to_mm(H, timber_corners_px)
 
-    # Pixel -> mm mapping for exact timber contour (approxPolyDP with 0.5px tolerance)
-    approx_cnt = cv2.approxPolyDP(contour, 0.5, True).reshape(-1, 2)
+    # Pixel -> mm mapping for contour with contour approximation (OpenCV approxPolyDP)
+    # Epsilon = factor * arcLength (OpenCV tutorial standard: https://docs.opencv.org/4.13.0/dd/d49/tutorial_py_contour_features.html)
+    peri = cv2.arcLength(contour, True)
+    approx_factor = float(getattr(config, "CONTOUR_APPROX_FACTOR", 0.001))
+    epsilon = approx_factor * peri
+    approx_contour_px = cv2.approxPolyDP(contour, epsilon, True)
+    approx_cnt = approx_contour_px.reshape(-1, 2)
     contour_mm_table = pixel_to_mm(H, approx_cnt)
+
+    print(f"\nContour Approximation:")
+    print(f"  Raw contour points:       {len(contour)}")
+    print(f"  Approx factor (epsilon):  {approx_factor} ({epsilon:.2f} px)")
+    print(f"  Approximated points:      {len(approx_contour_px)}")
 
     # Parallax compensation
     H_cam = float(getattr(config, "CAMERA_HEIGHT_MM", 0.0))
@@ -570,8 +589,8 @@ def measure_timber(img, image_path, timber_number, timber_thickness_mm=0.0):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2
             )
 
-    # Exact Timber contour (Yellow)
-    cv2.drawContours(overlay, [contour], -1, (0, 255, 255), 3)
+    # Exact Timber contour (Yellow, smoothed approxPolyDP)
+    cv2.drawContours(overlay, [approx_contour_px], -1, (0, 255, 255), 3)
 
     # Fitted Timber bounding box (Green) matching the yellow contour
     cv2.polylines(overlay, [np.int32(timber_corners_px)], True, (0, 255, 0), 3)
@@ -604,6 +623,106 @@ def measure_timber(img, image_path, timber_number, timber_thickness_mm=0.0):
     print(f"  Overlay:    {overlay_path}")
 
     return True
+
+
+# ============================================================
+# REAL-TIME LIVE VIEWPORT OVERLAY
+# ============================================================
+
+def render_live_viewport(img_undist, timber_number, current_thickness):
+    """
+    Run real-time detection on the live camera frame and return an annotated viewport display:
+    - Red outline for detected ArUco workspace
+    - Magenta boxes and IDs for ArUco markers
+    - Smooth Yellow contour (approxPolyDP) for detected timber
+    - Green bounding box and corner dots
+    - Real-time dimension readout (Length x Width mm) and status overlay
+    """
+    display = img_undist.copy()
+
+    H, errors_mm, detected_outer, detected_inner, detected_all = compute_live_homography(img_undist, verbose=False)
+
+    timber_detected = False
+    status_text = "Place timber inside black workspace"
+    dim_text = ""
+
+    if H is not None and detected_outer is not None:
+        # Physical workspace order: BL (1) -> BR (0) -> TR (3) -> TL (2)
+        workspace_outer_px = order_quad(
+            np.array([detected_outer[m] for m in [1, 0, 2, 3] if m in detected_outer], dtype=np.float32)
+        )
+
+        # Draw outer workspace boundary (Red)
+        cv2.polylines(display, [np.int32(workspace_outer_px)], True, (0, 0, 255), 2)
+
+        # Draw ArUco markers (Magenta)
+        for m_id in [1, 0, 2, 3]:
+            if m_id in detected_all:
+                pts = detected_all[m_id]
+                cv2.polylines(display, [np.int32(pts)], True, (255, 0, 255), 2)
+                c = pts.mean(axis=0)
+                cv2.putText(
+                    display, f"ID {m_id}", (int(c[0]) - 20, int(c[1])),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2
+                )
+
+        # Run fast live timber segmentation
+        contour, mask, timber_corners_px = segment_board(
+            img_undist, workspace_outer_px, detected_all, verbose=False
+        )
+
+        if contour is not None and timber_corners_px is not None:
+            timber_detected = True
+
+            # Contour approximation (Douglas-Peucker algorithm via cv2.approxPolyDP)
+            peri = cv2.arcLength(contour, True)
+            approx_factor = float(getattr(config, "CONTOUR_APPROX_FACTOR", 0.001))
+            epsilon = approx_factor * peri
+            approx_contour_px = cv2.approxPolyDP(contour, epsilon, True)
+
+            # Draw Yellow smoothed contour
+            cv2.drawContours(display, [approx_contour_px], -1, (0, 255, 255), 2)
+
+            # Draw Green bounding box
+            cv2.polylines(display, [np.int32(timber_corners_px)], True, (0, 255, 0), 2)
+
+            for i, pt in enumerate(timber_corners_px):
+                x, y = int(round(pt[0])), int(round(pt[1]))
+                cv2.circle(display, (x, y), 5, (0, 255, 0), -1)
+
+            # Live dimensions
+            corners_mm = pixel_to_mm(H, timber_corners_px)
+            side_lengths = [
+                float(np.linalg.norm(corners_mm[(i + 1) % 4] - corners_mm[i]))
+                for i in range(4)
+            ]
+            dim_a = (side_lengths[0] + side_lengths[2]) / 2.0
+            dim_b = (side_lengths[1] + side_lengths[3]) / 2.0
+            length_mm = max(dim_a, dim_b)
+            width_mm = min(dim_a, dim_b)
+            dim_text = f"Live: {length_mm:.1f} x {width_mm:.1f} mm ({len(approx_contour_px)} pts)"
+            status_text = "Timber detected! Press SPACE to capture"
+
+            # Label on timber centroid
+            cx = int(timber_corners_px[:, 0].mean())
+            cy = int(timber_corners_px[:, 1].mean())
+            cv2.putText(display, f"{length_mm:.1f} x {width_mm:.1f} mm", (cx - 70, cy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    else:
+        status_text = "Looking for 4 ArUco markers..."
+
+    # Top HUD Bar
+    h, w = display.shape[:2]
+    header = np.zeros((85, w, 3), dtype=np.uint8)
+    cv2.putText(header, f"TIMBER {timber_number:02d}  |  {dim_text if dim_text else status_text}", (20, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0) if timber_detected else (0, 200, 255), 2)
+    cv2.putText(header, f"SPACE = Capture & Save JSON  |  T = Thickness ({current_thickness:.1f} mm)  |  ENTER/ESC = Exit", (20, 68),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (220, 220, 220), 2)
+
+    # Blend header onto display
+    display[:85] = cv2.addWeighted(display[:85], 0.25, header, 0.75, 0)
+
+    return display
 
 
 # ============================================================
@@ -685,6 +804,7 @@ def main():
     print("=" * 60)
     print("\nCamera opened successfully.")
     print("Place ONE timber inside the black workspace.")
+    print("Live contour, detection box, and dimensions are displayed in real-time.")
     print("SPACE = capture and measure")
     print("T     = change timber thickness (for parallax correction)")
     print("ENTER / ESC = exit")
@@ -694,20 +814,20 @@ def main():
 
     timber_number = get_next_timber_number()
 
+    window_name = "Arducam - Black Background Timber Measurement"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1280, 850)
+
     while True:
         ret, frame = cap.read()
         if not ret:
             print("ERROR: Failed to read camera frame.")
             break
 
-        display = frame.copy()
-        cv2.putText(display, "SPACE = Capture / Measure", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(display, "T = Change Thickness", (30, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(display, "ENTER / ESC = Exit", (30, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(display, f"Next: TIMBER {timber_number:02d}", (30, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(display, f"Thickness: {current_thickness:.1f} mm", (30, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+        img_undist = undistort(frame)
+        display = render_live_viewport(img_undist, timber_number, current_thickness)
 
-        cv2.imshow("Arducam - Black Background Timber Measurement", display)
+        cv2.imshow(window_name, display)
         key = cv2.waitKey(1) & 0xFF
 
         if key == ord('t') or key == ord('T'):  # T = change thickness
