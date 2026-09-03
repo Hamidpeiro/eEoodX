@@ -1,42 +1,39 @@
 """
-Step 3: Capture and measure timbers one by one.
+Step 3: Capture and measure timbers on a black background.
 
 Pipeline:
-    camera
-    -> SPACE to capture timber
+    camera / test image
+    -> capture timber (or load test image)
     -> save original image
-    -> undistort
+    -> undistort lens using calibration
     -> detect 4 ArUco markers
-    -> calculate live homography
-    -> define workspace from ArUco markers
-    -> threshold timber inside workspace
-    -> remove ArUco markers
-    -> find timber contour
-    -> minAreaRect
-    -> sub-pixel corner refinement
-    -> map timber corners to real-world mm
-    -> compute length/width
-    -> sample color
-    -> save mask
-    -> save debug overlay
-    -> write JSON
+    -> calculate live pixel -> mm homography from outer marker corners
+    -> define workspace ROI from outer marker corners (masking out markers)
+    -> detect and remove the black background / curtain
+    -> extract timber as foreground on top of the black curtain
+    -> clean timber mask (fill internal grain, remove noise)
+    -> extract the exact yellow timber contour
+    -> fit oriented bounding rectangle (minAreaRect) matching the yellow contour
+    -> map corners to real-world mm
+    -> compute length/width and side dimensions
+    -> sample LAB color
+    -> save masks, debug overlay images, and JSON measurements
     -> wait for next timber
 
-Usage:
-    python 3_measure_board.py
+This file is intentionally independent from 3_measure_board.py.
+config.py is not modified by this script.
 
 Controls:
-    SPACE = capture and measure current timber
-    ENTER = exit
-
-All captured images, debug images and JSON files are saved to:
-    config.CAPTURE_DIR
+    SPACE = capture and measure
+    ENTER / ESC = exit
 """
 
 import cv2
 import numpy as np
 import json
 import os
+import sys
+import argparse
 import config
 
 
@@ -45,12 +42,12 @@ import config
 # ============================================================
 
 def undistort(img):
-    """Remove lens distortion using the saved camera calibration."""
+    """Remove lens distortion using the saved intrinsic calibration."""
+    if not os.path.exists(config.CAMERA_CALIB_FILE):
+        print(f"ERROR: Calibration file {config.CAMERA_CALIB_FILE} not found.")
+        return img
 
-    calib = np.load(
-        config.CAMERA_CALIB_FILE
-    )
-
+    calib = np.load(config.CAMERA_CALIB_FILE)
     return cv2.undistort(
         img,
         calib["camera_matrix"],
@@ -59,297 +56,73 @@ def undistort(img):
 
 
 # ============================================================
-# TIMBER SEGMENTATION
+# POINT / GEOMETRY HELPERS
 # ============================================================
 
-def segment_board(img, workspace_px):
-    """Detect one timber inside the ArUco workspace."""
+def polygon_mask(shape, points):
+    """Create a filled polygon mask."""
+    mask = np.zeros(shape[:2], dtype=np.uint8)
+    pts = np.asarray(points, dtype=np.float32)
+    pts = np.round(pts).astype(np.int32)
+    cv2.fillPoly(mask, [pts], 255)
+    return mask
 
-    # ========================================================
-    # 1. CREATE WORKSPACE MASK
-    # ========================================================
 
-    workspace_mask = np.zeros(
-        img.shape[:2],
-        dtype=np.uint8
+def order_quad(points):
+    """
+    Return four points in clockwise image order starting from top-left.
+    """
+    pts = np.asarray(points, dtype=np.float32).reshape(4, 2)
+    center = pts.mean(axis=0)
+
+    angles = np.arctan2(
+        pts[:, 1] - center[1],
+        pts[:, 0] - center[0]
     )
+    order = np.argsort(angles)
+    ordered = pts[order]
 
-    workspace_pts = np.array(
-        workspace_px,
-        dtype=np.int32
-    )
+    # Rotate so the first point is top-left (minimum x+y sum)
+    sums = ordered[:, 0] + ordered[:, 1]
+    first = int(np.argmin(sums))
+    ordered = np.roll(ordered, -first, axis=0)
 
-    cv2.fillPoly(
-        workspace_mask,
-        [workspace_pts],
-        255
-    )
+    # Ensure clockwise orientation
+    area = cv2.contourArea(ordered.reshape(-1, 1, 2))
+    if area < 0:
+        ordered = ordered[::-1]
 
-    # ========================================================
-    # 2. REMOVE ARUCO MARKER AREAS FROM WORKSPACE
-    # ========================================================
+    return ordered.astype(np.float32)
 
-    marker_radius = 110
 
-    for point in workspace_px:
-        x = int(round(point[0]))
-        y = int(round(point[1]))
-        cv2.circle(
-            workspace_mask,
-            (x, y),
-            marker_radius,
-            0,
-            -1
-        )
+def get_contour_oriented_box(contour):
+    """
+    Fit an oriented bounding rectangle directly to the yellow timber contour.
+    This guarantees that the measurement corners and green box tightly wrap
+    the exact segmented timber shape.
+    """
+    rect = cv2.minAreaRect(contour)
+    box = cv2.boxPoints(rect)
+    return order_quad(box)
 
-    # ========================================================
-    # 3. ADAPTIVE MULTI-CHANNEL SEGMENTATION
-    # ========================================================
 
-    lab = cv2.cvtColor(
-        img,
-        cv2.COLOR_BGR2LAB
-    )
-    hsv = cv2.cvtColor(
-        img,
-        cv2.COLOR_BGR2HSV
-    )
-
-    # --------------------------------------------------------
-    # Dynamic Table Background Estimation
-    # --------------------------------------------------------
-    L_f = lab[:, :, 0].astype(np.float32)
-    a_f = lab[:, :, 1].astype(np.float32)
-    b_f = lab[:, :, 2].astype(np.float32)
-    s_f = hsv[:, :, 1].astype(np.float32)
-
-    ws_valid = workspace_mask > 0
-    table_L = np.median(L_f[ws_valid]) if np.any(ws_valid) else 135.0
-    table_a = np.median(a_f[ws_valid]) if np.any(ws_valid) else 128.0
-    table_b = np.median(b_f[ws_valid]) if np.any(ws_valid) else 127.0
-    table_S = np.median(s_f[ws_valid]) if np.any(ws_valid) else 15.0
-
-    dL = table_L - L_f
-    da = a_f - table_a
-    db = b_f - table_b
-    dS = s_f - table_S
-
-    # Universal Timber Segmentation:
-    # Works dynamically for dark, medium, AND bright/light wood species (pine, birch, spruce, oak).
-    # Adapts to lighting changes and excludes neutral gray table shadows.
-    timber_mask = (
-        ((db > 3.0) & (dS > 8.0)) |
-        ((dL > 20.0) & (db > 1.5))
-    ).astype(np.uint8) * 255
-
-    timber_mask = cv2.bitwise_and(
-        timber_mask,
-        workspace_mask
-    )
-
-    # ========================================================
-    # 5. MORPHOLOGICAL CLEANUP
-    # ========================================================
-
-    # Fill small gaps caused by wood grain.
-    close_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (15, 15)
-    )
-
-    timber_mask = cv2.morphologyEx(
-        timber_mask,
-        cv2.MORPH_CLOSE,
-        close_kernel
-    )
-
-    # Remove small isolated color regions.
-    open_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (7, 7)
-    )
-
-    timber_mask = cv2.morphologyEx(
-        timber_mask,
-        cv2.MORPH_OPEN,
-        open_kernel
-    )
-
-    # ========================================================
-    # 6. FIND CONTOURS
-    # ========================================================
-
-    contours, _ = cv2.findContours(
-        timber_mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    if not contours:
-        return None, timber_mask
-
-    # ========================================================
-    # 7. FIND TIMBER CANDIDATES
-    # ========================================================
-
-    candidates = []
-
-    for contour in contours:
-
-        area = cv2.contourArea(contour)
-
-        if area < config.MIN_BOARD_CONTOUR_AREA_PX:
-            continue
-
-        # ----------------------------------------------------
-        # Minimum-area rectangle
-        # ----------------------------------------------------
-
-        rect = cv2.minAreaRect(contour)
-
-        rect_w = rect[1][0]
-        rect_h = rect[1][1]
-
-        if rect_w <= 1 or rect_h <= 1:
-            continue
-
-        rect_area = rect_w * rect_h
-
-        # ----------------------------------------------------
-        # Rectangularity
-        # ----------------------------------------------------
-
-        rectangularity = area / rect_area
-
-        # ----------------------------------------------------
-        # Solidity
-        # ----------------------------------------------------
-
-        hull = cv2.convexHull(contour)
-
-        hull_area = cv2.contourArea(hull)
-
-        if hull_area <= 1:
-            continue
-
-        solidity = area / hull_area
-
-        # ----------------------------------------------------
-        # Aspect ratio
-        # ----------------------------------------------------
-
-        aspect_ratio = (
-            max(rect_w, rect_h) /
-            min(rect_w, rect_h)
-        )
-
-        # A timber should be elongated.
-        if aspect_ratio < 2.0:
-            continue
-
-        # ----------------------------------------------------
-        # Score
-        # ----------------------------------------------------
-
-        score = (
-            area *
-            rectangularity *
-            solidity
-        )
-
-        candidates.append(
-            (
-                score,
-                contour,
-                area,
-                rectangularity,
-                solidity,
-                aspect_ratio
-            )
-        )
-
-    # ========================================================
-    # 8. NO TIMBER
-    # ========================================================
-
-    if not candidates:
-
-        print(
-            "  No suitable timber contour found."
-        )
-
-        return None, timber_mask
-
-    # ========================================================
-    # 9. SELECT BEST CANDIDATE
-    # ========================================================
-
-    candidates.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    (
-        score,
-        best_contour,
-        area,
-        rectangularity,
-        solidity,
-        aspect_ratio
-    ) = candidates[0]
-
-    print(
-        "\nTimber segmentation:"
-    )
-
-    print(
-        f"  Area:           {area:.0f} px"
-    )
-
-    print(
-        f"  Rectangularity: {rectangularity:.3f}"
-    )
-
-    print(
-        f"  Solidity:       {solidity:.3f}"
-    )
-
-    print(
-        f"  Aspect ratio:   {aspect_ratio:.2f}"
-    )
-
-    return best_contour, timber_mask
+# ============================================================
+# SUBPIXEL EDGE REFINEMENT
+# ============================================================
 
 def refine_corners_subpixel(img_gray, corners):
-    """Refine rectangle corners to sub-pixel accuracy."""
-
+    """Refine corners using subpixel gradient optimization."""
     criteria = (
-        cv2.TERM_CRITERIA_EPS +
-        cv2.TERM_CRITERIA_MAX_ITER,
+        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
         30,
         0.01
     )
 
-    pts = corners.reshape(
-        -1,
-        1,
-     
-        2
-    ).astype(np.float32)
-
+    pts = np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2)
     height, width = img_gray.shape[:2]
 
-    pts[:, 0, 0] = np.clip(
-        pts[:, 0, 0],
-        0,
-        width - 1
-    )
-
-    pts[:, 0, 1] = np.clip(
-        pts[:, 0, 1],
-        0,
-        height - 1
-    )
+    pts[:, 0, 0] = np.clip(pts[:, 0, 0], 1, width - 2)
+    pts[:, 0, 1] = np.clip(pts[:, 0, 1], 1, height - 2)
 
     refined = cv2.cornerSubPix(
         img_gray,
@@ -359,10 +132,140 @@ def refine_corners_subpixel(img_gray, corners):
         criteria
     )
 
-    return refined.reshape(
-        -1,
-        2
+    return order_quad(refined.reshape(-1, 2))
+
+
+# ============================================================
+# BLACK BACKGROUND / TIMBER SEGMENTATION
+# ============================================================
+
+def segment_board(img, workspace_outer_px, markers_dict=None):
+    """
+    Detect and segment timber on a black background.
+
+    Strategy:
+        1. Limit analysis to the full workspace defined by outer ArUco marker corners.
+        2. Mask out the ArUco marker square regions so markers do not affect segmentation.
+        3. Identify the black background curtain using Otsu and dark intensity filtering.
+        4. Extract the curtain domain to isolate the workspace and exclude outer table borders.
+        5. Extract timber as foreground inside the curtain domain.
+        6. Perform morphological cleaning (fill wood grain, remove specks).
+        7. Select the best timber candidate based on area, solidity, and aspect ratio.
+        8. Fit oriented bounding rectangle matching the exact yellow timber contour.
+    """
+    ws_mask = polygon_mask(img.shape, workspace_outer_px)
+
+    # Mask out the 4 ArUco markers with a safety dilation margin
+    if markers_dict:
+        markers_mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        for m_id, pts in markers_dict.items():
+            pts_int = np.round(pts).astype(np.int32)
+            cv2.fillPoly(markers_mask, [pts_int], 255)
+        markers_mask = cv2.dilate(markers_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+        usable_roi = cv2.bitwise_and(ws_mask, cv2.bitwise_not(markers_mask))
+    else:
+        usable_roi = ws_mask
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    roi_pixels = gray_blur[usable_roi > 0]
+    if roi_pixels.size < 100:
+        print("  ERROR: Usable workspace is too small.")
+        return None, np.zeros_like(gray), None
+
+    # Compute dark/background threshold
+    otsu_thresh, _ = cv2.threshold(
+        roi_pixels.reshape(-1, 1),
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
+    black_threshold = int(np.clip(otsu_thresh, 35, 120))
+
+    print(f"\nBlack-background segmentation:")
+    print(f"  Otsu threshold: {otsu_thresh:.1f}")
+    print(f"  Applied threshold: {black_threshold}")
+
+    # Binary mask of dark black curtain pixels inside the ROI
+    dark_mask = np.zeros_like(gray)
+    dark_mask[(gray_blur <= black_threshold) & (usable_roi > 0)] = 255
+
+    # Close small folds/seams in the black fabric
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    dark_mask_closed = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, close_kernel)
+
+    # Enclosing domain of the black curtain to isolate the black background workspace
+    curtain_cnts, _ = cv2.findContours(dark_mask_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    curtain_domain = np.zeros_like(gray)
+    for cnt in curtain_cnts:
+        if cv2.contourArea(cnt) > 15000:
+            hull = cv2.convexHull(cnt)
+            cv2.drawContours(curtain_domain, [hull], -1, 255, thickness=cv2.FILLED)
+
+    # Fallback to usable ROI if curtain domain is small or fragmented
+    if cv2.countNonZero(curtain_domain) < 0.25 * cv2.countNonZero(usable_roi):
+        curtain_domain = usable_roi.copy()
+
+    # Timber = Curtain Domain minus Dark Background Pixels
+    timber_raw = cv2.bitwise_and(curtain_domain, cv2.bitwise_not(dark_mask_closed))
+    timber_raw = cv2.bitwise_and(timber_raw, usable_roi)
+
+    # Morphological cleaning: close internal grain / open noise
+    t_close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    timber_mask = cv2.morphologyEx(timber_raw, cv2.MORPH_CLOSE, t_close_kernel)
+    t_open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    timber_mask = cv2.morphologyEx(timber_mask, cv2.MORPH_OPEN, t_open_kernel)
+
+    # Find timber candidates
+    contours, _ = cv2.findContours(timber_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        print("  ERROR: No foreground contour found.")
+        return None, timber_mask, None
+
+    min_area = getattr(config, "MIN_BOARD_CONTOUR_AREA_PX", 3000)
+    candidates = []
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area:
+            continue
+
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        if hull_area <= 0:
+            continue
+
+        solidity = area / hull_area
+        if solidity < 0.70:
+            continue
+
+        rect = cv2.minAreaRect(contour)
+        rw, rh = rect[1]
+        aspect_ratio = max(rw, rh) / max(min(rw, rh), 1.0)
+        if aspect_ratio < 1.8:
+            continue
+
+        score = area * min(aspect_ratio / 4.0, 2.0) * solidity
+        candidates.append((score, contour, area, aspect_ratio, solidity))
+
+    if not candidates:
+        print("  ERROR: No suitable timber contour found.")
+        return None, timber_mask, None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    score, best_contour, area, aspect_ratio, solidity = candidates[0]
+
+    print(f"\nTimber candidate:")
+    print(f"  Area:         {area:.0f} px")
+    print(f"  Aspect ratio: {aspect_ratio:.2f}")
+    print(f"  Solidity:     {solidity:.3f}")
+    print(f"  Score:        {score:.0f}")
+
+    # Extract tightly fitted bounding box matching the exact yellow contour
+    timber_corners_px = get_contour_oriented_box(best_contour)
+
+    return best_contour, timber_mask, timber_corners_px
 
 
 # ============================================================
@@ -371,25 +274,9 @@ def refine_corners_subpixel(img_gray, corners):
 
 def pixel_to_mm(H, pts_px):
     """Transform image pixel coordinates into world coordinates."""
-
-    pts_px = np.array(
-        pts_px,
-        dtype=np.float32
-    ).reshape(
-        -1,
-        1,
-        2
-    )
-
-    pts_mm = cv2.perspectiveTransform(
-        pts_px,
-        H
-    )
-
-    return pts_mm.reshape(
-        -1,
-        2
-    )
+    pts_px = np.asarray(pts_px, dtype=np.float32).reshape(-1, 1, 2)
+    pts_mm = cv2.perspectiveTransform(pts_px, H)
+    return pts_mm.reshape(-1, 2)
 
 
 # ============================================================
@@ -397,253 +284,114 @@ def pixel_to_mm(H, pts_px):
 # ============================================================
 
 def compute_live_homography(img_undist):
-    """Detect four ArUco markers and calculate pixel -> mm
-    homography using the outer corner of each marker.
     """
-
+    Detect all 4 ArUco markers and dynamically identify:
+        - Outer corners: for high-accuracy pixel -> mm homography and outer workspace
+    """
     aruco_dict = cv2.aruco.getPredefinedDictionary(
-        getattr(
-            cv2.aruco,
-            config.ARUCO_DICT
-        )
+        getattr(cv2.aruco, config.ARUCO_DICT)
     )
-
     aruco_params = cv2.aruco.DetectorParameters()
+    detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
-    detector = cv2.aruco.ArucoDetector(
-        aruco_dict,
-        aruco_params
-    )
-
-    gray = cv2.cvtColor(
-        img_undist,
-        cv2.COLOR_BGR2GRAY
-    )
-
-    corners, ids, _ = detector.detectMarkers(
-        gray
-    )
+    gray = cv2.cvtColor(img_undist, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = detector.detectMarkers(gray)
 
     if ids is None:
-
-        print(
-            "  warning: no ArUco markers detected"
-        )
-
-        return None, None, None
+        print("  WARNING: no ArUco markers detected.")
+        return None, None, None, None, None
 
     ids = ids.flatten()
+    detected_all = {}
+    for marker_id, marker_corners in zip(ids, corners):
+        detected_all[int(marker_id)] = marker_corners[0]
 
-    # OpenCV ArUco corner order:
-    #
-    # [0] -------- [1]
-    #  |            |
-    #  |            |
-    # [3] -------- [2]
+    expected_ids = set(config.MARKER_WORLD_POSITIONS_MM.keys())
+    detected_ids = set(detected_all.keys())
 
-    outer_corner_index = {
-        0: 0,
-        1: 1,
-        2: 2,
-        3: 3,
-    }
+    if not expected_ids.issubset(detected_ids):
+        missing = expected_ids - detected_ids
+        print(f"  WARNING: markers not all visible (missing {missing})")
+        return None, None, None, None, None
 
-    detected = {}
+    # Compute centroid of all 4 markers
+    all_centers = [detected_all[m_id].mean(axis=0) for m_id in expected_ids]
+    ws_centroid = np.mean(all_centers, axis=0)
 
-    for marker_id, marker_corners in zip(
-        ids,
-        corners
-    ):
+    # Dynamically find outer corners based on distance to workspace centroid
+    detected_outer = {}
+    detected_inner = {}
 
-        marker_id = int(
-            marker_id
-        )
+    for m_id in expected_ids:
+        pts = detected_all[m_id]
+        dists = np.linalg.norm(pts - ws_centroid, axis=1)
+        detected_inner[m_id] = pts[np.argmin(dists)]
+        detected_outer[m_id] = pts[np.argmax(dists)]
 
-        if marker_id not in outer_corner_index:
-            continue
-
-        corner_index = (
-            outer_corner_index[
-                marker_id
-            ]
-        )
-
-        detected[marker_id] = (
-            marker_corners[0][corner_index]
-        )
-
-    # --------------------------------------------------------
-    # Check all markers
-    # --------------------------------------------------------
-
-    expected_ids = set(
-        config.MARKER_WORLD_POSITIONS_MM.keys()
-    )
-
-    detected_ids = set(
-        detected.keys()
-    )
-
-    if not expected_ids.issubset(
-        detected_ids
-    ):
-
-        missing = (
-            expected_ids -
-            detected_ids
-        )
-
-        print(
-            f"  warning: markers not all visible "
-            f"(missing {missing})"
-        )
-
-        return None, None, None
-
-    # --------------------------------------------------------
-    # Pixel/world correspondences
-    # --------------------------------------------------------
-
+    # Homography correspondences
     pixel_pts = []
     world_pts = []
 
-    for marker_id, world_xy in (
-        config.MARKER_WORLD_POSITIONS_MM.items()
-    ):
+    for marker_id, world_xy in config.MARKER_WORLD_POSITIONS_MM.items():
+        pixel_pts.append(detected_outer[marker_id])
+        world_pts.append(world_xy)
 
-        pixel_pts.append(
-            detected[marker_id]
-        )
+    pixel_pts = np.asarray(pixel_pts, dtype=np.float32)
+    world_pts = np.asarray(world_pts, dtype=np.float32)
 
-        world_pts.append(
-            world_xy
-        )
-
-    pixel_pts = np.array(
-        pixel_pts,
-        dtype=np.float32
-    )
-
-    world_pts = np.array(
-        world_pts,
-        dtype=np.float32
-    )
-
-    # --------------------------------------------------------
-    # Homography
-    # --------------------------------------------------------
-
-    H, _ = cv2.findHomography(
-        pixel_pts,
-        world_pts,
-        method=0
-    )
-
+    H, _ = cv2.findHomography(pixel_pts, world_pts, method=0)
     if H is None:
-
-        print(
-            "  warning: could not calculate homography"
-        )
-
-        return None, None, None
-
-    # --------------------------------------------------------
-    # Reprojection error
-    # --------------------------------------------------------
+        print("  WARNING: could not calculate homography.")
+        return None, None, None, None, None
 
     reprojected = cv2.perspectiveTransform(
-        pixel_pts.reshape(
-            -1,
-            1,
-            2
-        ),
+        pixel_pts.reshape(-1, 1, 2),
         H
-    ).reshape(
-        -1,
-        2
-    )
+    ).reshape(-1, 2)
 
-    errors_mm = np.linalg.norm(
-        reprojected - world_pts,
-        axis=1
-    )
+    errors_mm = np.linalg.norm(reprojected - world_pts, axis=1)
 
-    # --------------------------------------------------------
-    # Print marker positions
-    # --------------------------------------------------------
+    print("\nArUco marker positions in world coordinates:")
+    for marker_id, point in zip(config.MARKER_WORLD_POSITIONS_MM.keys(), reprojected):
+        print(f"  Marker {marker_id}: X={point[0]:.2f} mm, Y={point[1]:.2f} mm")
 
-    print(
-        "\nArUco marker positions in world coordinates:"
-    )
+    print(f"\n  Maximum marker reprojection error: {errors_mm.max():.4f} mm")
 
-    for marker_id, point in zip(
-        config.MARKER_WORLD_POSITIONS_MM.keys(),
-        reprojected
-    ):
-
-        print(
-            f"  Marker {marker_id}: "
-            f"X={point[0]:.2f} mm, "
-            f"Y={point[1]:.2f} mm"
-        )
-
-    print(
-        f"\n  Maximum marker reprojection error: "
-        f"{errors_mm.max():.4f} mm"
-    )
-
-    return (
-        H,
-        errors_mm,
-        detected
-    )
+    return H, errors_mm, detected_outer, detected_inner, detected_all
 
 
 # ============================================================
 # COLOR SAMPLING
 # ============================================================
 
-def sample_color_lab(img_bgr, contour):
-    """Calculate average LAB color from inside the timber."""
+def sample_timber_color(img_bgr, contour):
+    """Calculate average LAB, RGB, and HEX color from inside the timber."""
+    mask = np.zeros(img_bgr.shape[:2], np.uint8)
+    cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
+    if cv2.countNonZero(mask) > 400:
+        eroded = cv2.erode(mask, np.ones((7, 7), np.uint8))
+        if cv2.countNonZero(eroded) > 100:
+            mask = eroded
 
-    mask = np.zeros(
-        img_bgr.shape[:2],
-        np.uint8
-    )
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    mean_lab = cv2.mean(lab, mask=mask)[:3]
 
-    cv2.drawContours(
-        mask,
-        [contour],
-        -1,
-        255,
-        thickness=cv2.FILLED
-    )
-
-    mask = cv2.erode(
-        mask,
-        np.ones(
-            (25, 25),
-            np.uint8
-        )
-    )
-
-    lab = cv2.cvtColor(
-        img_bgr,
-        cv2.COLOR_BGR2LAB
-    )
-
-    mean_lab = cv2.mean(
-        lab,
-        mask=mask
-    )[:3]
-
-    if config.USE_COLOR_CHART_CORRECTION:
-        pass
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    mean_rgb = cv2.mean(rgb, mask=mask)[:3]
+    r, g, b = int(round(mean_rgb[0])), int(round(mean_rgb[1])), int(round(mean_rgb[2]))
 
     return {
-        "L": round(mean_lab[0], 2),
-        "a": round(mean_lab[1], 2),
-        "b": round(mean_lab[2], 2)
+        "lab": {
+            "L": round(float(mean_lab[0]), 2),
+            "a": round(float(mean_lab[1]), 2),
+            "b": round(float(mean_lab[2]), 2)
+        },
+        "rgb": {
+            "R": r,
+            "G": g,
+            "B": b
+        },
+        "hex": f"#{r:02x}{g:02x}{b:02x}"
     }
 
 
@@ -651,439 +399,184 @@ def sample_color_lab(img_bgr, contour):
 # MEASURE ONE TIMBER
 # ============================================================
 
-def measure_timber(
-    img,
-    image_path,
-    timber_number
-):
-    """Measure one captured timber."""
-
+def measure_timber(img, image_path, timber_number, timber_thickness_mm=0.0):
     print("\n" + "=" * 60)
-    print(
-        f"MEASURING TIMBER {timber_number:02d}"
-    )
+    print(f"MEASURING TIMBER {timber_number:02d}  (thickness: {timber_thickness_mm:.1f} mm)")
     print("=" * 60)
 
-    # --------------------------------------------------------
-    # Undistort
-    # --------------------------------------------------------
+    img_undist = undistort(img)
 
-    img_undist = undistort(
-        img
-    )
-
-    # --------------------------------------------------------
-    # Live homography
-    # --------------------------------------------------------
-
-    H, errors_mm, detected = (
-        compute_live_homography(
-            img_undist
-        )
-    )
+    (
+        H,
+        errors_mm,
+        detected_outer,
+        detected_inner,
+        detected_all
+    ) = compute_live_homography(img_undist)
 
     if H is None:
-
-        print(
-            "\nERROR: Could not detect all four "
-            "ArUco markers."
-        )
-
+        print("\nERROR: Could not detect all four ArUco markers.")
         return False
 
-    # --------------------------------------------------------
-    # Homography quality
-    # --------------------------------------------------------
-
-    max_err = errors_mm.max()
-
-    print(
-        f"\nLive homography OK."
-    )
-
-    print(
-        f"Maximum marker reprojection error: "
-        f"{max_err:.2f} mm"
-    )
-
+    max_err = float(errors_mm.max())
+    print(f"\nLive homography OK. Maximum marker error: {max_err:.2f} mm")
     if max_err > 2.0:
+        print(f"WARNING: marker error is high ({max_err:.2f} mm).")
 
-        print(
-            f"WARNING: marker error is "
-            f"{max_err:.2f} mm."
-        )
+    # Physical workspace order: TL (2) -> TR (3) -> BR (0) -> BL (1)
+    workspace_outer_px = np.array([
+        detected_outer[2],
+        detected_outer[3],
+        detected_outer[0],
+        detected_outer[1]
+    ], dtype=np.float32)
 
-    # --------------------------------------------------------
-    # Workspace
-    # --------------------------------------------------------
-
-    workspace_px = np.array(
-        [
-            detected[0],
-            detected[1],
-            detected[2],
-            detected[3]
-        ],
-        dtype=np.float32
-    )
-
-    # --------------------------------------------------------
-    # Detect timber
-    # --------------------------------------------------------
-
-    contour, mask = segment_board(
+    contour, mask, timber_corners_px = segment_board(
         img_undist,
-        workspace_px
+        workspace_outer_px,
+        detected_all
     )
 
-    base_name = (
-        f"timber_{timber_number:02d}"
-    )
+    base_name = f"timber_{timber_number:02d}"
+    os.makedirs(config.CAPTURE_DIR, exist_ok=True)
+    mask_path = os.path.join(config.CAPTURE_DIR, f"{base_name}_mask.png")
+    cv2.imwrite(mask_path, mask)
 
-    # --------------------------------------------------------
-    # ALWAYS save mask
-    # --------------------------------------------------------
-
-    mask_path = os.path.join(
-        config.CAPTURE_DIR,
-        f"{base_name}_mask.png"
-    )
-
-    cv2.imwrite(
-        mask_path,
-        mask
-    )
-
-    # --------------------------------------------------------
-    # Check timber
-    # --------------------------------------------------------
-
-    if contour is None:
-
-        print(
-            "\nERROR: No timber detected."
-        )
-
-        print(
-            f"Mask saved to:"
-        )
-
-        print(
-            mask_path
-        )
-
+    if contour is None or timber_corners_px is None:
+        print("\nERROR: No timber detected.")
+        print(f"Mask saved to: {mask_path}")
         return False
 
-    # ========================================================
-    # MIN AREA RECTANGLE
-    # ========================================================
+    # Pixel -> mm mapping for corners
+    corners_mm_table = pixel_to_mm(H, timber_corners_px)
 
-    rect = cv2.minAreaRect(
-        contour
-    )
+    # Pixel -> mm mapping for exact timber contour (approxPolyDP with 0.5px tolerance)
+    approx_cnt = cv2.approxPolyDP(contour, 0.5, True).reshape(-1, 2)
+    contour_mm_table = pixel_to_mm(H, approx_cnt)
 
-    box_px = cv2.boxPoints(
-        rect
-    )
+    # Parallax compensation
+    H_cam = float(getattr(config, "CAMERA_HEIGHT_MM", 0.0))
+    h_timber = float(timber_thickness_mm)
 
-    # --------------------------------------------------------
-    # Sub-pixel refinement
-    # --------------------------------------------------------
-
-    gray = cv2.cvtColor(
-        img_undist,
-        cv2.COLOR_BGR2GRAY
-    )
-
-    box_px_refined = (
-        refine_corners_subpixel(
-            gray,
-            box_px
-        )
-    )
-
-    # --------------------------------------------------------
-    # Pixel -> mm (Table plane)
-    # --------------------------------------------------------
-
-    box_mm_table = pixel_to_mm(
-        H,
-        box_px_refined
-    )
-
-    # --------------------------------------------------------
-    # Height Parallax Compensation (from config.py)
-    # --------------------------------------------------------
-    H_cam = config.CAMERA_HEIGHT_MM
-    h_timber = config.TIMBER_THICKNESS_MM
-
-    if H_cam > 0 and h_timber > 0 and H_cam > h_timber:
+    if H_cam > 0 and h_timber > 0 and H_cam > h_timber and os.path.exists(config.CAMERA_CALIB_FILE):
         scale_factor = (H_cam - h_timber) / H_cam
-
         calib = np.load(config.CAMERA_CALIB_FILE)
         K = calib["camera_matrix"]
         cx, cy = K[0, 2], K[1, 2]
         cam_center_table = pixel_to_mm(H, [[cx, cy]])[0]
         Xc, Yc = cam_center_table[0], cam_center_table[1]
 
-        box_mm = []
-        for pt in box_mm_table:
+        corners_mm = []
+        for pt in corners_mm_table:
             X_corr = Xc + (pt[0] - Xc) * scale_factor
             Y_corr = Yc + (pt[1] - Yc) * scale_factor
-            box_mm.append([X_corr, Y_corr])
-        box_mm = np.array(box_mm, dtype=np.float32)
+            corners_mm.append([X_corr, Y_corr])
+        corners_mm = np.asarray(corners_mm, dtype=np.float32)
+
+        contour_mm = []
+        for pt in contour_mm_table:
+            X_corr = Xc + (pt[0] - Xc) * scale_factor
+            Y_corr = Yc + (pt[1] - Yc) * scale_factor
+            contour_mm.append([X_corr, Y_corr])
+        contour_mm = np.asarray(contour_mm, dtype=np.float32)
     else:
-        box_mm = box_mm_table
+        corners_mm = corners_mm_table
+        contour_mm = contour_mm_table
 
-    # --------------------------------------------------------
-    # Side lengths
-    # --------------------------------------------------------
+    # Surface Area calculation in real-world mm²
+    surface_area_mm2 = abs(cv2.contourArea(contour_mm.astype(np.float32).reshape(-1, 1, 2)))
+    surface_area_cm2 = surface_area_mm2 / 100.0
 
-    side_lengths = []
+    # Dimensions
+    side_lengths = [
+        float(np.linalg.norm(corners_mm[(i + 1) % 4] - corners_mm[i]))
+        for i in range(4)
+    ]
+    dim_a = (side_lengths[0] + side_lengths[2]) / 2.0
+    dim_b = (side_lengths[1] + side_lengths[3]) / 2.0
+    length_mm = max(dim_a, dim_b)
+    width_mm = min(dim_a, dim_b)
 
-    for i in range(4):
+    # Sample color (LAB + RGB + HEX)
+    color_info = sample_timber_color(img_undist, contour)
 
-        p1 = box_mm[i]
-
-        p2 = box_mm[
-            (i + 1) % 4
-        ]
-
-        side_lengths.append(
-            float(
-                np.linalg.norm(
-                    p2 - p1
-                )
-            )
-        )
-
-    length_mm = (
-        side_lengths[0] +
-        side_lengths[2]
-    ) / 2
-
-    width_mm = (
-        side_lengths[1] +
-        side_lengths[3]
-    ) / 2
-
-    if width_mm > length_mm:
-
-        length_mm, width_mm = (
-            width_mm,
-            length_mm
-        )
-
-    # --------------------------------------------------------
-    # Color
-    # --------------------------------------------------------
-
-    color = sample_color_lab(
-        img_undist,
-        contour
-    )
-
-    # ========================================================
-    # JSON
-    # ========================================================
-
+    # Build JSON result
     result = {
-
         "timber_id": timber_number,
-
-        "source_image": os.path.abspath(
-            image_path
-        ),
-
-        "length_mm": round(
-            length_mm,
-            2
-        ),
-
-        "width_mm": round(
-            width_mm,
-            2
-        ),
-
+        "source_image": os.path.abspath(image_path),
+        "length_mm": round(length_mm, 2),
+        "width_mm": round(width_mm, 2),
+        "surface_area_mm2": round(float(surface_area_mm2), 2),
+        "surface_area_cm2": round(float(surface_area_cm2), 2),
+        "side_lengths_mm": [round(s, 2) for s in side_lengths],
         "corners_mm": [
-            [
-                round(float(x), 2),
-                round(float(y), 2)
-            ]
-            for x, y in box_mm
+            [round(float(x), 2), round(float(y), 2)]
+            for x, y in corners_mm
         ],
-
-        "color_lab": color,
-
+        "contour_mm": [
+            [round(float(x), 2), round(float(y), 2)]
+            for x, y in contour_mm
+        ],
+        "timber_thickness_mm": round(timber_thickness_mm, 1),
+        "color_rgb": color_info["rgb"],
+        "color_hex": color_info["hex"],
+        "color_lab": color_info["lab"],
         "defects": []
     }
 
-    # --------------------------------------------------------
-    # Save JSON
-    # --------------------------------------------------------
+    out_path = os.path.join(config.CAPTURE_DIR, f"{base_name}_measurement.json")
+    with open(out_path, "w") as f:
+        json.dump(result, f, indent=2)
 
-    out_path = os.path.join(
-        config.CAPTURE_DIR,
-        f"{base_name}_measurement.json"
-    )
-
-    with open(
-        out_path,
-        "w"
-    ) as f:
-
-        json.dump(
-            result,
-            f,
-            indent=2
-        )
-
-    # ========================================================
-    # DEBUG OVERLAY
-    # ========================================================
-
+    # Debug Overlay
     overlay = img_undist.copy()
 
-    # Workspace
-    cv2.polylines(
-        overlay,
-        [
-            np.int32(
-                workspace_px
+    # Outer workspace (Red)
+    cv2.polylines(overlay, [np.int32(workspace_outer_px)], True, (0, 0, 255), 3)
+
+    # ArUco markers (Magenta)
+    for m_id in [0, 1, 2, 3]:
+        if m_id in detected_all:
+            pts = detected_all[m_id]
+            cv2.polylines(overlay, [np.int32(pts)], True, (255, 0, 255), 2)
+            c = pts.mean(axis=0)
+            cv2.putText(
+                overlay, f"ID {m_id}", (int(c[0]), int(c[1])),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2
             )
-        ],
-        isClosed=True,
-        color=(0, 0, 255),
-        thickness=6
-    )
 
-    # ArUco reference points
-    for marker_id in [0, 1, 2, 3]:
+    # Exact Timber contour (Yellow)
+    cv2.drawContours(overlay, [contour], -1, (0, 255, 255), 3)
 
-        point = detected[
-            marker_id
-        ]
+    # Fitted Timber bounding box (Green) matching the yellow contour
+    cv2.polylines(overlay, [np.int32(timber_corners_px)], True, (0, 255, 0), 3)
 
-        x = int(
-            round(point[0])
-        )
-
-        y = int(
-            round(point[1])
-        )
-
-        cv2.circle(
-            overlay,
-            (x, y),
-            10,
-            (255, 0, 0),
-            -1
-        )
-
-        cv2.putText(
-            overlay,
-            str(marker_id),
-            (x + 15, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 0, 0),
-            2
-        )
-
-    # Timber rectangle
-    cv2.polylines(
-        overlay,
-        [
-            np.int32(
-                box_px_refined
-            )
-        ],
-        isClosed=True,
-        color=(0, 255, 0),
-        thickness=6
-    )
+    for i, pt in enumerate(timber_corners_px):
+        x, y = int(round(pt[0])), int(round(pt[1]))
+        cv2.circle(overlay, (x, y), 7, (0, 255, 0), -1)
+        cv2.putText(overlay, str(i), (x + 10, y + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
     # Labels
-    cv2.putText(
-        overlay,
-        "RED = ArUco workspace",
-        (30, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (0, 0, 255),
-        2
-    )
+    cv2.putText(overlay, "RED: workspace | YELLOW: timber contour | GREEN: measured box", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(overlay, f"Dim: {length_mm:.1f} x {width_mm:.1f} mm  |  Area: {surface_area_cm2:.1f} cm2  (Thick: {timber_thickness_mm:.1f} mm)", (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
 
-    cv2.putText(
-        overlay,
-        "GREEN = detected timber",
-        (30, 80),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (0, 255, 0),
-        2
-    )
-
-    cv2.putText(
-        overlay,
-        f"TIMBER {timber_number:02d}",
-        (30, 120),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (255, 255, 255),
-        2
-    )
-
-    overlay_path = os.path.join(
-        config.CAPTURE_DIR,
-        f"{base_name}_overlay.png"
-    )
-
-    cv2.imwrite(
-        overlay_path,
-        overlay
-    )
-
-    # ========================================================
-    # PRINT RESULT
-    # ========================================================
+    overlay_path = os.path.join(config.CAPTURE_DIR, f"{base_name}_overlay.png")
+    cv2.imwrite(overlay_path, overlay)
 
     print("\n" + "-" * 60)
-    print(
-        f"TIMBER {timber_number:02d} MEASUREMENT"
-    )
+    print(f"TIMBER {timber_number:02d} MEASUREMENT")
     print("-" * 60)
-
-    print(
-        f"Length: {length_mm:.2f} mm"
-    )
-
-    print(
-        f"Width:  {width_mm:.2f} mm"
-    )
-
-    print(
-        f"Color LAB: "
-        f"L={color['L']:.2f}, "
-        f"a={color['a']:.2f}, "
-        f"b={color['b']:.2f}"
-    )
-
-    print(
-        f"\nMeasurement saved:"
-    )
-
-    print(
-        out_path
-    )
-
-    print(
-        f"Overlay saved:"
-    )
-
-    print(
-        overlay_path
-    )
+    print(f"Length:       {length_mm:.2f} mm")
+    print(f"Width:        {width_mm:.2f} mm")
+    print(f"Surface Area: {surface_area_mm2:.1f} mm² ({surface_area_cm2:.2f} cm²)")
+    print(f"Thickness:    {timber_thickness_mm:.1f} mm (parallax input)")
+    print(f"Sides:        {[round(s, 2) for s in side_lengths]} mm")
+    print(f"Color RGB:    R={color_info['rgb']['R']}, G={color_info['rgb']['G']}, B={color_info['rgb']['B']} ({color_info['hex']})")
+    print(f"Color LAB:    L={color_info['lab']['L']:.2f}, a={color_info['lab']['a']:.2f}, b={color_info['lab']['b']:.2f}")
+    print(f"\nSaved:")
+    print(f"  JSON:       {out_path}")
+    print(f"  Mask:       {mask_path}")
+    print(f"  Overlay:    {overlay_path}")
 
     return True
 
@@ -1094,302 +587,137 @@ def measure_timber(
 
 def get_next_timber_number():
     """Find the next available timber number."""
-
-    os.makedirs(
-        config.CAPTURE_DIR,
-        exist_ok=True
-    )
-
+    os.makedirs(config.CAPTURE_DIR, exist_ok=True)
     number = 1
-
     while True:
-
-        json_path = os.path.join(
-            config.CAPTURE_DIR,
-            f"timber_{number:02d}_measurement.json"
-        )
-
-        if not os.path.exists(
-            json_path
-        ):
+        json_path = os.path.join(config.CAPTURE_DIR, f"timber_{number:02d}_measurement.json")
+        if not os.path.exists(json_path):
             return number
-
         number += 1
 
 
 # ============================================================
-# MAIN CAMERA LOOP
+# MAIN CAMERA LOOP / IMAGE PROCESSING
 # ============================================================
 
 def main():
+    parser = argparse.ArgumentParser(description="Measure timber on black background.")
+    parser.add_argument("--image", type=str, default=None, help="Path to a single image file to process directly.")
+    parser.add_argument("--number", type=int, default=None, help="Timber ID number when processing a single image.")
+    parser.add_argument("--thickness", type=float, default=None,
+                        help="Timber thickness in mm for parallax compensation. "
+                             "If not specified, uses TIMBER_THICKNESS_MM from config.py.")
+    args = parser.parse_args()
 
-    # --------------------------------------------------------
-    # Create capture directory
-    # --------------------------------------------------------
+    # Determine initial timber thickness
+    if args.thickness is not None:
+        current_thickness = args.thickness
+    else:
+        current_thickness = float(getattr(config, "TIMBER_THICKNESS_MM", 0.0))
 
-    os.makedirs(
-        config.CAPTURE_DIR,
-        exist_ok=True
-    )
+    os.makedirs(config.CAPTURE_DIR, exist_ok=True)
 
-    # --------------------------------------------------------
-    # Check calibration
-    # --------------------------------------------------------
-
-    if not os.path.exists(
-        config.CAMERA_CALIB_FILE
-    ):
-
-        print(
-            f"ERROR: Missing "
-            f"{config.CAMERA_CALIB_FILE}"
-        )
-
-        print(
-            "Run 1_calibrate_camera.py first."
-        )
-
+    if not os.path.exists(config.CAMERA_CALIB_FILE):
+        print(f"ERROR: Missing {config.CAMERA_CALIB_FILE}")
+        print("Run 1_calibrate_camera.py first.")
         raise SystemExit(1)
 
-    # --------------------------------------------------------
-    # Camera
-    # --------------------------------------------------------
+    # Direct image processing mode
+    if args.image is not None:
+        if not os.path.exists(args.image):
+            print(f"ERROR: Image file not found: {args.image}")
+            raise SystemExit(1)
 
+        img = cv2.imread(args.image)
+        if img is None:
+            print(f"ERROR: Could not read image: {args.image}")
+            raise SystemExit(1)
+
+        timber_num = args.number if args.number is not None else 1
+        print(f"Processing static image: {args.image} as timber {timber_num:02d}...")
+        print(f"Timber thickness for parallax: {current_thickness:.1f} mm")
+        success = measure_timber(img, args.image, timber_num, current_thickness)
+        if success:
+            print("\nMeasurement finished successfully.")
+        else:
+            print("\nMeasurement failed.")
+            raise SystemExit(1)
+        return
+
+    # Live Camera mode
     CAMERA_INDEX = 1
-
-    cap = cv2.VideoCapture(
-        CAMERA_INDEX,
-        cv2.CAP_DSHOW
-    )
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        # Fallback to default index 0 if 1 fails
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
 
     if not cap.isOpened():
-
-        print(
-            "ERROR: Could not open Arducam B0477."
-        )
-
+        print("ERROR: Could not open camera.")
         raise SystemExit(1)
 
     print("\n" + "=" * 60)
-    print("TIMBER MEASUREMENT CAMERA")
+    print("TIMBER MEASUREMENT CAMERA - BLACK BACKGROUND")
     print("=" * 60)
+    print("\nCamera opened successfully.")
+    print("Place ONE timber inside the black workspace.")
+    print("SPACE = capture and measure")
+    print("T     = change timber thickness (for parallax correction)")
+    print("ENTER / ESC = exit")
+    print(f"\nCurrent timber thickness: {current_thickness:.1f} mm")
+    print(f"Camera height: {getattr(config, 'CAMERA_HEIGHT_MM', 0.0):.0f} mm")
+    print(f"Output folder: {config.CAPTURE_DIR}")
 
-    print(
-        "\nCamera opened successfully."
-    )
-
-    print(
-        "Place ONE timber inside the workspace."
-    )
-
-    print(
-        "SPACE = capture and measure"
-    )
-
-    print(
-        "ENTER = exit"
-    )
-
-    print(
-        f"\nOutput folder:"
-    )
-
-    print(
-        config.CAPTURE_DIR
-    )
-
-    # --------------------------------------------------------
-    # Timber number
-    # --------------------------------------------------------
-
-    timber_number = (
-        get_next_timber_number()
-    )
-
-    # --------------------------------------------------------
-    # Camera loop
-    # --------------------------------------------------------
+    timber_number = get_next_timber_number()
 
     while True:
-
         ret, frame = cap.read()
-
         if not ret:
-
-            print(
-                "ERROR: Failed to read camera frame."
-            )
-
+            print("ERROR: Failed to read camera frame.")
             break
-
-        # ----------------------------------------------------
-        # Live preview
-        # ----------------------------------------------------
 
         display = frame.copy()
+        cv2.putText(display, "SPACE = Capture / Measure", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(display, "T = Change Thickness", (30, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(display, "ENTER / ESC = Exit", (30, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(display, f"Next: TIMBER {timber_number:02d}", (30, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(display, f"Thickness: {current_thickness:.1f} mm", (30, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
 
-        cv2.putText(
-            display,
-            "SPACE = Capture / Measure",
-            (30, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 255, 255),
-            2
-        )
-
-        cv2.putText(
-            display,
-            "ENTER = Exit",
-            (30, 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 255, 255),
-            2
-        )
-
-        cv2.putText(
-            display,
-            f"Next: TIMBER {timber_number:02d}",
-            (30, 120),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 255, 255),
-            2
-        )
-
-        cv2.imshow(
-            "Arducam B0477 - Timber Measurement",
-            display
-        )
-
-        # IMPORTANT:
-        # waitKey must be called after imshow.
+        cv2.imshow("Arducam - Black Background Timber Measurement", display)
         key = cv2.waitKey(1) & 0xFF
 
-        # ----------------------------------------------------
-        # SPACE = CAPTURE
-        # ----------------------------------------------------
+        if key == ord('t') or key == ord('T'):  # T = change thickness
+            print(f"\nCurrent timber thickness: {current_thickness:.1f} mm")
+            try:
+                new_val = input("Enter new timber thickness in mm (e.g. 20, 35, 50): ").strip()
+                current_thickness = float(new_val)
+                print(f"Timber thickness set to: {current_thickness:.1f} mm")
+            except (ValueError, EOFError):
+                print("Invalid input. Thickness unchanged.")
 
-        if key == 32:
+        elif key == 32:  # SPACE
+            print(f"\nCapturing timber {timber_number:02d} (thickness: {current_thickness:.1f} mm)...")
+            image_path = os.path.join(config.CAPTURE_DIR, f"timber_{timber_number:02d}.jpg")
+            cv2.imwrite(image_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 100])
+            print(f"Captured: {image_path}")
 
-            print(
-                f"\nCapturing timber "
-                f"{timber_number:02d}..."
-            )
-
-            # ------------------------------------------------
-            # Save original image
-            # ------------------------------------------------
-
-            image_path = os.path.join(
-                config.CAPTURE_DIR,
-                f"timber_{timber_number:02d}.jpg"
-            )
-
-            success = cv2.imwrite(
-                image_path,
-                frame,
-                [
-                    cv2.IMWRITE_JPEG_QUALITY,
-                    100
-                ]
-            )
-
-            if not success:
-
-                print(
-                    "ERROR: Could not save "
-                    "captured image."
-                )
-
-                continue
-
-            print(
-                f"Captured:"
-            )
-
-            print(
-                image_path
-            )
-
-            # ------------------------------------------------
-            # Measure
-            # ------------------------------------------------
-
-            success = measure_timber(
-                frame,
-                image_path,
-                timber_number
-            )
-
+            success = measure_timber(frame, image_path, timber_number, current_thickness)
             if success:
-
-                print(
-                    "\n" + "=" * 60
-                )
-
-                print(
-                    f"TIMBER {timber_number:02d} COMPLETE"
-                )
-
-                print(
-                    "=" * 60
-                )
-
+                print("\n" + "=" * 60)
+                print(f"TIMBER {timber_number:02d} COMPLETE")
+                print("=" * 60)
                 timber_number += 1
-
-                print(
-                    "\nPlace the next timber."
-                )
-
-                print(
-                    f"Press SPACE to measure "
-                    f"timber {timber_number:02d}."
-                )
-
+                print(f"\nPlace next timber. Press SPACE to measure timber {timber_number:02d}.")
+                print(f"Press T to change thickness if the next timber is different.")
             else:
+                print("\nMeasurement failed. Timber number not increased. Adjust and press SPACE.")
 
-                print(
-                    "\nMeasurement failed."
-                )
-
-                print(
-                    "Timber number was NOT increased."
-                )
-
-                print(
-                    "Correct the timber position "
-                    "and press SPACE to try again."
-                )
-
-        # ----------------------------------------------------
-        # ENTER = EXIT
-        # ----------------------------------------------------
-
-        elif key in (10, 13):
-
-            print(
-                "\nEnter pressed. Exiting..."
-            )
-
+        elif key in (10, 13, 27):  # ENTER or ESC
+            print("\nExiting...")
             break
 
-    # --------------------------------------------------------
-    # Cleanup
-    # --------------------------------------------------------
-
     cap.release()
-
     cv2.destroyAllWindows()
-
-    print(
-        "\nCamera released."
-    )
-
-    print(
-        "Measurement session finished."
-    )
+    print("\nMeasurement session finished.")
 
 
 # ============================================================
