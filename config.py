@@ -52,6 +52,16 @@ MARKER_WORLD_POSITIONS_MM = {
 }
 
 # ---------------------------------------------------------------------------
+# Camera Setup & Parallax Compensation
+# ---------------------------------------------------------------------------
+# Height from camera lens to table surface in mm.
+# Update this value if you adjust camera mounting height.
+CAMERA_HEIGHT_MM = 1750.0
+
+# Timber thickness in mm (set to 0.0 to measure directly on table plane without requiring thickness input)
+TIMBER_THICKNESS_MM = 0.0
+
+# ---------------------------------------------------------------------------
 # Segmentation (board vs background)
 # ---------------------------------------------------------------------------
 # Simple approach: background is a known, roughly uniform color (e.g. a dark

@@ -1,30 +1,30 @@
 {
   "timber_id": 1,
   "source_image": "c:\\Users\\hamid\\Documents\\GitHub\\eEoodX\\sample_output\\captures\\timber_01.jpg",
-  "length_mm": 608.73,
-  "width_mm": 219.07,
+  "length_mm": 462.28,
+  "width_mm": 56.27,
   "corners_mm": [
     [
-      712.06,
-      -7.09
+      584.85,
+      344.21
     ],
     [
-      792.86,
-      179.32
+      150.16,
+      188.74
     ],
     [
-      211.6,
-      385.45
+      169.76,
+      132.85
     ],
     [
-      135.91,
-      162.99
+      603.6,
+      294.31
     ]
   ],
   "color_lab": {
-    "L": 73.93,
-    "a": 133.94,
-    "b": 134.44
+    "L": 149.99,
+    "a": 148.88,
+    "b": 157.66
   },
   "defects": []
 }

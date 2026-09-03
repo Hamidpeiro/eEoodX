@@ -3,10 +3,8 @@
 Static setup: one board placed under a fixed overhead camera (Arducam B0477,
 IMX283, 16mm C-mount), photographed, measured, and exported to Rhino.
 
-This is a skeleton to get a real pixel → millimetre pipeline running on your
-actual rig. It's been tested end-to-end on synthetic images (correct
-geometry math, valid file formats), but **not against a real camera** —
-expect to spend real time tuning `config.py` once you have hardware in hand.
+This is a complete pixel → millimetre measurement and segmentation pipeline running on your
+actual rig.
 
 ## Install
 
@@ -24,8 +22,7 @@ are set, don't touch them again** — every script after this assumes a fixed
 lens state.
 
 ### 2. Build the table
-A flat surface, ~3.5m long, covered in a uniform, non-reflective, dark mat —
-this makes background segmentation trivial. Diffuse lighting along its full
+A flat surface, ~3.5m long, covered in a uniform, light or dark mat / surface. Diffuse lighting along its full
 length (not a single overhead point light — you'll get a hot spot in the
 middle and dark corners).
 
@@ -41,7 +38,7 @@ to match — this is the ground truth everything else is scaled against.
 
 ### 4. Calibrate the lens
 Print a checkerboard (any "9x6 squares" PDF works, giving 8x5 inner
-corners — the default in `config.py`). Tape it to something rigid.
+corners — default in `config.py` or 13x8 inner corners for larger boards). Tape it to something rigid.
 
 Take 15–25 photos of it at the camera's actual working distance/focus,
 covering different parts of the frame (corners, edges, tilted). Save into
@@ -68,45 +65,36 @@ Check the per-marker reprojection error it prints — should be near 0mm.
 Anything over a few mm means a mismeasured marker position or a marker
 that's not flat.
 
-**Note:** `3_measure_board.py` (step 7) detects these same 4 markers *live,
-in every board photo*, and computes a fresh homography each time rather
-than reusing a cached one — this catches the camera drifting or getting
-bumped between shots, which a one-time calibration wouldn't. This step is
-mainly a pre-flight check that your marker positions in `config.py` are
-correct, and it also writes a cached homography that `3_measure_board.py`
-falls back to on the rare shot where a marker is temporarily obstructed.
+### 6. Timber Segmentation Pipeline
+The timber segmentation inside `3_measure_board.py` uses an adaptive multi-channel pipeline:
+- **Workspace-Constrained Otsu Thresholding**: Calculates dynamic Otsu threshold on the Lightness channel (`L`) in LAB space specifically inside the ArUco workspace polygon, separating dark timber from bright table background.
+- **LAB & HSV Warmth Filtering**: Uses chromaticity (`b* > 132`, `a* > 129`, `S > 35`) to strictly isolate timber wood grain from neutral gray shadows and white table surface.
+- **ArUco Marker Masking**: Automatically masks out circular regions around the 4 ArUco markers before thresholding to prevent tape edges, marker borders, and reflections from interfering with timber bounding boxes.
 
-### 6. Tune the background threshold
-Take a photo of the empty table (or with a board on it), then:
+### 7. Interactive Live Measurement & Capture
+Run the live measurement camera loop:
 
 ```bash
-python 3_measure_board.py path/to/photo.jpg --debug
+python 3_measure_board.py
 ```
 
-This writes `sample_output/<name>_mask.png` — open it and check the board
-(or the empty mat) is being separated cleanly from the background. Adjust
-`config.BACKGROUND_HSV_LOWER` / `BACKGROUND_HSV_UPPER` until it's clean,
-then re-run.
+**Controls:**
+- **`SPACE`**: Capture current frame, run homography & timber measurement, increment timber number, and save outputs.
+- **`ENTER`**: Exit the camera loop.
 
-### 7. Measure a board
-```bash
-python 3_measure_board.py path/to/board_photo.jpg
-```
-
-Outputs `sample_output/<name>_measurement.json` with length, width, corner
-positions (mm), and average color in LAB. Watch the printed marker
-reprojection error each time — it's a live check that the rig hasn't moved
-since setup. **Important: the 4 markers must stay visible and unobstructed
-by the board in every shot** — place them outside where boards will
-actually sit.
+All output files are automatically saved to `sample_output/captures/`:
+- `timber_XX.jpg`: Original captured image frame
+- `timber_XX_mask.png`: Binary segmentation mask of detected timber
+- `timber_XX_overlay.png`: Visual overlay displaying detected ArUco workspace (red) and measured timber outline (green)
+- `timber_XX_measurement.json`: Real-world measurements including length (mm), width (mm), corner coordinates (mm), and average LAB color
 
 ### 8. Export to Rhino
 ```bash
-python 4_export_rhino.py sample_output/board_photo_measurement.json
+python 4_export_rhino.py sample_output/captures/timber_01_measurement.json sample_output/captures/timber_02_measurement.json
 ```
 
-Produces `sample_output/boards.3dm` — a closed polyline outline plus a text
-label, in real-world mm. Pass multiple JSON files at once to combine several
+Produces `sample_output/boards.3dm` — closed polyline outlines plus text
+labels, in real-world mm. Pass multiple JSON files at once to combine several
 boards into one file. Open directly in Rhino, or feed into Rhino.Inside /
 Grasshopper for a live pipeline.
 

@@ -77,7 +77,7 @@ def segment_board(img, workspace_px):
     workspace_pts = np.array(
         workspace_px,
         dtype=np.int32
-    )
+    ).reshape(-1, 2)
 
     cv2.fillPoly(
         workspace_mask,
@@ -86,59 +86,16 @@ def segment_board(img, workspace_px):
     )
 
     # ========================================================
-    # 2. HSV COLOR SEGMENTATION
+    # 2. REMOVE ARUCO MARKER AREAS FROM WORKSPACE
     # ========================================================
 
-    hsv = cv2.cvtColor(
-        img,
-        cv2.COLOR_BGR2HSV
-    )
-
-    h, s, v = cv2.split(hsv)
-
-    # --------------------------------------------------------
-    # Timber color
-    #
-    # The timber in timber_05 is brown/orange.
-    # We therefore look for:
-    #
-    #   Hue        -> warm colors
-    #   Saturation -> clearly colored pixels
-    #   Value      -> exclude very dark ArUco pixels
-    #
-    # This is intentionally NOT taken from config.py.
-    # config.py remains unchanged.
-    # --------------------------------------------------------
-
-    timber_mask = (
-        (h >= 0) &
-        (h <= 35) &
-        (s >= 35) &
-        (v >= 40)
-    ).astype(np.uint8) * 255
-
-    # ========================================================
-    # 3. KEEP ONLY WORKSPACE
-    # ========================================================
-
-    timber_mask = cv2.bitwise_and(
-        timber_mask,
-        workspace_mask
-    )
-
-    # ========================================================
-    # 4. REMOVE ARUCO MARKER AREAS
-    # ========================================================
-
-    marker_radius = 100
+    marker_radius = 140
 
     for point in workspace_px:
-
-        x = int(round(point[0]))
-        y = int(round(point[1]))
-
+        x = int(round(float(point[0])))
+        y = int(round(float(point[1])))
         cv2.circle(
-            timber_mask,
+            workspace_mask,
             (x, y),
             marker_radius,
             0,
@@ -146,13 +103,60 @@ def segment_board(img, workspace_px):
         )
 
     # ========================================================
+    # 3. GRAYSCALE BILATERAL FILTERING & MULTI-CHANNEL MODEL
+    # ========================================================
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Bilateral filter removes background noise while preserving crisp timber boundaries
+    blur_gray = cv2.bilateralFilter(gray, 9, 75, 75)
+
+    lab = cv2.cvtColor(
+        img,
+        cv2.COLOR_BGR2LAB
+    )
+    hsv = cv2.cvtColor(
+        img,
+        cv2.COLOR_BGR2HSV
+    )
+
+    # --------------------------------------------------------
+    # Dynamic Table Background Estimation
+    # --------------------------------------------------------
+    L_f = lab[:, :, 0].astype(np.float32)
+    b_f = lab[:, :, 2].astype(np.float32)
+    s_f = hsv[:, :, 1].astype(np.float32)
+
+    ws_valid = workspace_mask > 0
+    table_gray = np.median(blur_gray[ws_valid]) if np.any(ws_valid) else 235.0
+    table_b = np.median(b_f[ws_valid]) if np.any(ws_valid) else 128.0
+    table_S = np.median(s_f[ws_valid]) if np.any(ws_valid) else 10.0
+
+    gray_diff = table_gray - blur_gray.astype(np.float32)
+    db = b_f - table_b
+    dS = s_f - table_S
+
+    # Grayscale + Filter + Shadow Separation Model:
+    # 1. Warm/chromatic timber (bright wood, sapwood, pine, birch): db > 8.0 & dS > 15.0
+    # 2. Dark/medium timber (oak, walnut, hardwood): gray_diff > 30.0 & db > 4.0
+    # 3. Table shadows are strictly rejected because they have neutral color (db <= 3.0, dS <= 10.0).
+    timber_mask = (
+        ((db > 8.0) & (dS > 15.0)) |
+        ((gray_diff > 30.0) & (db > 4.0))
+    ).astype(np.uint8) * 255
+
+    timber_mask = cv2.bitwise_and(
+        timber_mask,
+        workspace_mask
+    )
+
+    # ========================================================
     # 5. MORPHOLOGICAL CLEANUP
     # ========================================================
 
-    # Fill small gaps caused by wood grain.
+    # Fill small gaps caused by wood grain while maintaining clean straight edges.
     close_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (15, 15)
+        cv2.MORPH_RECT,
+        (11, 11)
     )
 
     timber_mask = cv2.morphologyEx(
@@ -161,10 +165,10 @@ def segment_board(img, workspace_px):
         close_kernel
     )
 
-    # Remove small isolated color regions.
+    # Remove small isolated color noise regions.
     open_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (7, 7)
+        cv2.MORPH_RECT,
+        (5, 5)
     )
 
     timber_mask = cv2.morphologyEx(
@@ -331,6 +335,7 @@ def refine_corners_subpixel(img_gray, corners):
     pts = corners.reshape(
         -1,
         1,
+     
         2
     ).astype(np.float32)
 
@@ -800,13 +805,37 @@ def measure_timber(
     )
 
     # --------------------------------------------------------
-    # Pixel -> mm
+    # Pixel -> mm (Table plane)
     # --------------------------------------------------------
 
-    box_mm = pixel_to_mm(
+    box_mm_table = pixel_to_mm(
         H,
         box_px_refined
     )
+
+    # --------------------------------------------------------
+    # Height Parallax Compensation (from config.py)
+    # --------------------------------------------------------
+    H_cam = config.CAMERA_HEIGHT_MM
+    h_timber = config.TIMBER_THICKNESS_MM
+
+    if H_cam > 0 and h_timber > 0 and H_cam > h_timber:
+        scale_factor = (H_cam - h_timber) / H_cam
+
+        calib = np.load(config.CAMERA_CALIB_FILE)
+        K = calib["camera_matrix"]
+        cx, cy = K[0, 2], K[1, 2]
+        cam_center_table = pixel_to_mm(H, [[cx, cy]])[0]
+        Xc, Yc = cam_center_table[0], cam_center_table[1]
+
+        box_mm = []
+        for pt in box_mm_table:
+            X_corr = Xc + (pt[0] - Xc) * scale_factor
+            Y_corr = Yc + (pt[1] - Yc) * scale_factor
+            box_mm.append([X_corr, Y_corr])
+        box_mm = np.array(box_mm, dtype=np.float32)
+    else:
+        box_mm = box_mm_table
 
     # --------------------------------------------------------
     # Side lengths
