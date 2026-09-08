@@ -14,19 +14,78 @@ CALIB_DIR = os.path.join(BASE_DIR, "calibration_data")
 CAMERA_CALIB_FILE = os.path.join(CALIB_DIR, "camera_intrinsics.npz")
 HOMOGRAPHY_FILE = os.path.join(CALIB_DIR, "homography.npz")
 OUTPUT_DIR = os.path.join(BASE_DIR, "sample_output")
-# All captured timber images, debug images and measurement JSON files # are stored here. 
-CAPTURE_DIR = os.path.join( OUTPUT_DIR, "captures" )
+# All captured timber images, debug images and measurement JSON files are stored here.
+CAPTURE_DIR = os.path.join(OUTPUT_DIR, "captures")
 
 # ---------------------------------------------------------------------------
-# Camera (Arducam B0498 8.3MP / 4K)
+# Camera Device & Video Stream (Angetube 4K / 120° Wide Angle Webcam)
 # ---------------------------------------------------------------------------
-# Native still resolution. If you capture at a lower resolution for speed,
-# change this and re-run calibration at that same resolution.
 CAMERA_INDEX = 1
 
-IMAGE_WIDTH =  5472
-IMAGE_HEIGHT =  3648
-PIXEL_SIZE_UM = 2.4  # sensor physical pixel pitch, from datasheet
+# Capture resolution (e.g., 3840x2160 4K, 1920x1080 FHD)
+IMAGE_WIDTH = 3840
+IMAGE_HEIGHT = 2160
+CAMERA_FPS = 30
+CAMERA_FOURCC = "MJPG"
+
+# ---------------------------------------------------------------------------
+# Camera Hardware Parameters (via duvc_ctl / UVC DirectShow)
+# Ranges for Angetube Webcam:
+#   Focus: 0 - 1023 (manual focus value, e.g. 450)
+#   Digital Zoom: 1.0 (1.0x full 120° FOV) to 4.0 (4.0x zoom)
+#   Exposure: -13 to -1 (log2 scale; -5 is standard)
+#   Brightness, Contrast, Saturation, Sharpness: 1 to 64 (default 32)
+#   Gain: 0 to 15 (default 0)
+#   White Balance: 1800 to 10000 K (default 5000)
+# ---------------------------------------------------------------------------
+
+# Focus control:
+#   CAMERA_FOCUS_MODE: "manual" or "auto"
+#   CAMERA_FOCUS_VALUE: Integer value (0 to 1023, e.g. 350, 450, 500)
+CAMERA_FOCUS_MODE = "manual"
+CAMERA_FOCUS_VALUE = 390
+
+# Zoom control:
+#   Float zoom multiplier: 1.0 = full wide-angle (no zoom), 1.5 = 1.5x zoom, 2.0 = 2.0x zoom
+CAMERA_ZOOM = 1.80
+
+# Exposure & Light controls:
+#   CAMERA_EXPOSURE_MODE: "auto" or "manual"
+#   CAMERA_EXPOSURE_VALUE: integer (-13 to -1, e.g. -5)
+CAMERA_EXPOSURE_MODE = "auto"
+CAMERA_EXPOSURE_VALUE = -5
+
+# Image adjustments:
+CAMERA_BRIGHTNESS = 24
+CAMERA_CONTRAST = 30
+CAMERA_SATURATION = 32      # 1 - 64 (default 32)
+CAMERA_SHARPNESS = 32       # 1 - 64 (default 32)
+CAMERA_GAIN = 0             # 0 - 15 (default 0)
+CAMERA_BACKLIGHT_COMPENSATION = 0
+
+# White Balance:
+#   CAMERA_WHITE_BALANCE_MODE: "auto" or "manual"
+#   CAMERA_WHITE_BALANCE_TEMPERATURE: Color temp in Kelvin (1800 to 10000, default 5000)
+CAMERA_WHITE_BALANCE_MODE = "auto"
+CAMERA_WHITE_BALANCE_TEMPERATURE = 5000
+
+# ---------------------------------------------------------------------------
+# Lens Calibration Model (Fisheye vs Standard Pinhole)
+# ---------------------------------------------------------------------------
+# For 120°+ wide-angle lenses, "fisheye" (cv2.fisheye) is strongly recommended.
+CALIBRATION_MODEL = "fisheye"  # "fisheye" or "standard"
+
+# Fisheye Undistortion Parameters:
+#   FISHEYE_BALANCE: 0.0 retains only valid pixels (no black edges / cropped),
+#                    1.0 retains all pixels including corners (with black edges).
+#   FISHEYE_FOV_SCALE: scale factor for output FOV (1.0 = normal).
+FISHEYE_BALANCE = 0.0
+FISHEYE_FOV_SCALE = 1.0
+
+# Fisheye Calibration Optimization Flags
+FISHEYE_CHECK_COND = True
+FISHEYE_RECOMPUTE_EXTRINSIC = True
+FISHEYE_FIX_SKEW = True
 
 # ---------------------------------------------------------------------------
 # Checkerboard used for intrinsic (lens distortion) calibration
@@ -59,7 +118,7 @@ MARKER_WORLD_POSITIONS_MM = {
 # ---------------------------------------------------------------------------
 # Height from camera lens to table surface in mm.
 # Update this value if you adjust camera mounting height.
-CAMERA_HEIGHT_MM = 1750.0
+CAMERA_HEIGHT_MM = 1620.0
 
 # Timber thickness in mm (set to 0.0 to measure directly on table plane without requiring thickness input)
 TIMBER_THICKNESS_MM = 0.0

@@ -1,0 +1,30 @@
+WORKSPACE HOMOGRAPHY CALIBRATION
+==================================================
+
+Workspace image: c:\Users\hamid\Documents\GitHub\eEoodX\Webcam detection\calibration_data\workspace_photos\workspace.jpg
+
+Detected marker IDs:
+[0, 1, 2, 3]
+
+Pixel points (outer marker corners):
+[[1201. 1340.]
+ [2627. 1346.]
+ [1207.  516.]
+ [2645.  538.]]
+
+World points (mm):
+[[  0.   0.]
+ [776.   0.]
+ [  0. 440.]
+ [776. 440.]]
+
+Homography matrix H:
+[[ 5.1800705191e-01  3.7718960091e-03 -6.2718081000e+02]
+ [ 2.1994472448e-03 -5.2273529518e-01  6.9782375940e+02]
+ [-1.3019448864e-05 -1.0300172599e-05  1.0000000000e+00]]
+
+Reprojection errors (mm):
+Marker 1: 0.000000 mm
+Marker 0: 0.000000 mm
+Marker 2: 0.000000 mm
+Marker 3: 0.000000 mm

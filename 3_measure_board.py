@@ -1165,19 +1165,30 @@ def main():
     )
 
     if not cap.isOpened():
-
         print(
-            "ERROR: Could not open Arducam B0477."
+            "ERROR: Could not open Arducam camera."
         )
-
         raise SystemExit(1)
+
+    target_w = getattr(config, "IMAGE_WIDTH", 3840)
+    target_h = getattr(config, "IMAGE_HEIGHT", 2160)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
+    for _ in range(5):
+        cap.read()
+
+    actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
 
     print("\n" + "=" * 60)
     print("TIMBER MEASUREMENT CAMERA")
     print("=" * 60)
 
     print(
-        "\nCamera opened successfully."
+        f"\nCamera opened successfully at resolution: {actual_w:.0f}x{actual_h:.0f}"
     )
 
     print(

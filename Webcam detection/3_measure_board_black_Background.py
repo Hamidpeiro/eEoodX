@@ -35,6 +35,7 @@ import os
 import sys
 import argparse
 import config
+import camera_utils
 
 
 # ============================================================
@@ -42,29 +43,8 @@ import config
 # ============================================================
 
 def undistort(img):
-    """Remove lens distortion using the saved intrinsic calibration."""
-    if not os.path.exists(config.CAMERA_CALIB_FILE):
-        print(f"ERROR: Calibration file {config.CAMERA_CALIB_FILE} not found.")
-        return img
-
-    calib = np.load(config.CAMERA_CALIB_FILE)
-    K = calib["camera_matrix"].copy()
-    dist = calib["dist_coeffs"]
-
-    # Scale camera matrix if current image resolution differs from calibration resolution
-    calib_size = calib.get("image_size", None)
-    if calib_size is not None:
-        calib_w, calib_h = float(calib_size[0]), float(calib_size[1])
-        img_h, img_w = img.shape[:2]
-        if (img_w, img_h) != (int(calib_w), int(calib_h)):
-            scale_x = img_w / calib_w
-            scale_y = img_h / calib_h
-            K[0, 0] *= scale_x  # fx
-            K[1, 1] *= scale_y  # fy
-            K[0, 2] *= scale_x  # cx
-            K[1, 2] *= scale_y  # cy
-
-    return cv2.undistort(img, K, dist)
+    """Remove lens distortion using the saved intrinsic calibration (supports fisheye and standard)."""
+    return camera_utils.undistort(img)
 
 
 # ============================================================
@@ -702,8 +682,26 @@ def render_live_viewport(img_undist, timber_number, current_thickness):
                 x, y = int(round(pt[0])), int(round(pt[1]))
                 cv2.circle(display, (x, y), 5, (0, 255, 0), -1)
 
-            # Live dimensions
-            corners_mm = pixel_to_mm(H, timber_corners_px)
+            # Live dimensions with parallax compensation
+            corners_mm_raw = pixel_to_mm(H, timber_corners_px)
+
+            # Apply parallax correction (same formula as measure_timber)
+            H_cam = float(getattr(config, "CAMERA_HEIGHT_MM", 0.0))
+            h_timber = float(current_thickness)
+            if H_cam > 0 and h_timber > 0 and H_cam > h_timber and os.path.exists(config.CAMERA_CALIB_FILE):
+                scale_factor = (H_cam - h_timber) / H_cam
+                calib = np.load(config.CAMERA_CALIB_FILE)
+                K = calib["camera_matrix"]
+                cx_cam, cy_cam = K[0, 2], K[1, 2]
+                cam_center_table = pixel_to_mm(H, [[cx_cam, cy_cam]])[0]
+                Xc, Yc = cam_center_table[0], cam_center_table[1]
+                corners_mm = np.array([
+                    [Xc + (pt[0] - Xc) * scale_factor, Yc + (pt[1] - Yc) * scale_factor]
+                    for pt in corners_mm_raw
+                ], dtype=np.float32)
+            else:
+                corners_mm = corners_mm_raw
+
             side_lengths = [
                 float(np.linalg.norm(corners_mm[(i + 1) % 4] - corners_mm[i]))
                 for i in range(4)
@@ -712,7 +710,8 @@ def render_live_viewport(img_undist, timber_number, current_thickness):
             dim_b = (side_lengths[1] + side_lengths[3]) / 2.0
             length_mm = max(dim_a, dim_b)
             width_mm = min(dim_a, dim_b)
-            dim_text = f"Live: {length_mm:.1f} x {width_mm:.1f} mm ({len(approx_contour_px)} pts)"
+            thick_label = f"  T={current_thickness:.0f}mm" if current_thickness > 0 else ""
+            dim_text = f"Live: {length_mm:.1f} x {width_mm:.1f} mm ({len(approx_contour_px)} pts){thick_label}"
             status_text = "Timber detected! Press SPACE to capture"
 
             # Label on timber centroid
@@ -802,27 +801,7 @@ def main():
         return
 
     # Live Camera mode
-    camera_index = config.CAMERA_INDEX
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        # Fallback to default index 0 if 1 fails
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-
-    if not cap.isOpened():
-        print("ERROR: Could not open camera.")
-        raise SystemExit(1)
-
-    # Configure high resolution mode from config.py
-    target_w = getattr(config, "IMAGE_WIDTH", 3840)
-    target_h = getattr(config, "IMAGE_HEIGHT", 2160)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, target_w)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-
-    # Discard initial warm-up frames to stabilize exposure/gain
-    for _ in range(5):
-        cap.read()
+    cap, controller = camera_utils.open_configured_camera()
 
     actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
     actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
@@ -842,55 +821,65 @@ def main():
 
     timber_number = get_next_timber_number()
 
-    window_name = "Arducam - Black Background Timber Measurement"
+    window_name = "Timber Measurement - Live View"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 1280, 850)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("ERROR: Failed to read camera frame.")
-            break
+    zoom_factor = float(getattr(config, "CAMERA_ZOOM", getattr(config, "CAMERA_ZOOM_VALUE", 1.0)))
 
-        img_undist = undistort(frame)
-        display = render_live_viewport(img_undist, timber_number, current_thickness)
+    try:
+        while True:
+            ret, raw_frame = cap.read()
+            if not ret:
+                print("ERROR: Failed to read camera frame.")
+                break
 
-        cv2.imshow(window_name, display)
-        key = cv2.waitKey(1) & 0xFF
+            frame = camera_utils.apply_digital_zoom(raw_frame, zoom_factor)
+            img_undist = undistort(frame)
+            display = render_live_viewport(img_undist, timber_number, current_thickness)
 
-        if key == ord('t') or key == ord('T'):  # T = change thickness
-            print(f"\nCurrent timber thickness: {current_thickness:.1f} mm")
+            cv2.imshow(window_name, display)
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord('t') or key == ord('T'):  # T = change thickness
+                print(f"\nCurrent timber thickness: {current_thickness:.1f} mm")
+                try:
+                    new_val = input("Enter new timber thickness in mm (e.g. 20, 35, 50): ").strip()
+                    current_thickness = float(new_val)
+                    print(f"Timber thickness set to: {current_thickness:.1f} mm")
+                except (ValueError, EOFError):
+                    print("Invalid input. Thickness unchanged.")
+
+            elif key == 32:  # SPACE
+                print(f"\nCapturing timber {timber_number:02d} (thickness: {current_thickness:.1f} mm)...")
+                image_path = os.path.join(config.CAPTURE_DIR, f"timber_{timber_number:02d}.jpg")
+                cv2.imwrite(image_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 100])
+                print(f"Captured: {image_path}")
+
+                success = measure_timber(frame, image_path, timber_number, current_thickness)
+                if success:
+                    print("\n" + "=" * 60)
+                    print(f"TIMBER {timber_number:02d} COMPLETE")
+                    print("=" * 60)
+                    timber_number += 1
+                    print(f"\nPlace next timber. Press SPACE to measure timber {timber_number:02d}.")
+                    print(f"Press T to change thickness if the next timber is different.")
+                else:
+                    print("\nMeasurement failed. Timber number not increased. Adjust and press SPACE.")
+
+            elif key in (10, 13, 27):  # ENTER or ESC
+                print("\nExiting...")
+                break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        if controller is not None:
             try:
-                new_val = input("Enter new timber thickness in mm (e.g. 20, 35, 50): ").strip()
-                current_thickness = float(new_val)
-                print(f"Timber thickness set to: {current_thickness:.1f} mm")
-            except (ValueError, EOFError):
-                print("Invalid input. Thickness unchanged.")
-
-        elif key == 32:  # SPACE
-            print(f"\nCapturing timber {timber_number:02d} (thickness: {current_thickness:.1f} mm)...")
-            image_path = os.path.join(config.CAPTURE_DIR, f"timber_{timber_number:02d}.jpg")
-            cv2.imwrite(image_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 100])
-            print(f"Captured: {image_path}")
-
-            success = measure_timber(frame, image_path, timber_number, current_thickness)
-            if success:
-                print("\n" + "=" * 60)
-                print(f"TIMBER {timber_number:02d} COMPLETE")
-                print("=" * 60)
-                timber_number += 1
-                print(f"\nPlace next timber. Press SPACE to measure timber {timber_number:02d}.")
-                print(f"Press T to change thickness if the next timber is different.")
-            else:
-                print("\nMeasurement failed. Timber number not increased. Adjust and press SPACE.")
-
-        elif key in (10, 13, 27):  # ENTER or ESC
-            print("\nExiting...")
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-    print("\nMeasurement session finished.")
+                controller.close()
+            except Exception:
+                pass
+        print("\nMeasurement session finished.")
 
 
 # ============================================================
