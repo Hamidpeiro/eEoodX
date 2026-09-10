@@ -1,3 +1,6 @@
 opencv-contrib-python
 numpy
 rhino3dm
+duvc_ctl
+websocket-client'Grasshopper'
+pip install PySide6 websockets
